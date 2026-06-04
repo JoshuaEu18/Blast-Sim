@@ -1,0 +1,207 @@
+/* ── Global ─────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  zoom: 0.85;            /* scale the whole UI to 85% — works in Chrome/Edge/Safari */
+}
+
+body {
+  background: #0d1117;
+  color: #e6edf3;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 13px;
+  margin: 0;
+}
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #0d1117; }
+::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+
+/* ── Layout shell ────────────────────────────────────── */
+#root, .container-fluid { padding: 0 !important; margin: 0 !important; max-width: 100% !important; }
+
+/* ── Header bar ─────────────────────────────────────── */
+.sim-header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 20px;
+  background: #161b22;
+  border-bottom: 1px solid #30363d;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+.sim-header h4 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: #f85149;
+  letter-spacing: 0.5px;
+}
+.sim-header .badge-pill {
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* ── Sidebar ─────────────────────────────────────────── */
+.sidebar {
+  background: #161b22;
+  border-right: 1px solid #30363d;
+  height: 100%;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto 1fr;  /* button row = natural height; controls row = rest */
+}
+/* The scrollable controls area sits in the 1fr grid row */
+.sidebar-scroll {
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-height: 0;         /* required: grid items default to min-height:auto */
+}
+
+.section-label {
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: #8b949e;
+  margin: 8px 0 4px;
+  padding-bottom: 3px;
+  border-bottom: 1px solid #21262d;
+}
+.section-label.accent-red  { color: #f85149; border-color: #f8514930; }
+.section-label.accent-blue { color: #388bfd; border-color: #388bfd30; }
+
+/* ── Number inputs ───────────────────────────────────── */
+/* Focus ring for the _numbox dcc.Input fields */
+input[type=number]:focus {
+  border-color: #388bfd !important;
+  box-shadow: 0 0 0 3px #388bfd22;
+}
+/* Hide browser up/down spinners — value is typed directly */
+input[type=number]::-webkit-inner-spin-button,
+input[type=number]::-webkit-outer-spin-button { opacity: 0.4; }
+
+/* Legacy .slider-label still used for material / burst-type labels */
+.slider-label {
+  color: #8b949e;
+  font-size: 11px;
+  margin-bottom: 3px;
+}
+
+/* ── Dropdowns ───────────────────────────────────────── */
+.Select-control, .Select-menu-outer,
+.VirtualizedSelectFocusedOption,
+.VirtualizedSelectOption             { background: #21262d !important; color: #e6edf3 !important; }
+.Select-control { border: 1px solid #30363d !important; border-radius: 6px !important; }
+.Select-value-label { color: #e6edf3 !important; }
+.Select--single > .Select-control .Select-value { color: #e6edf3 !important; }
+
+/* ── Run button ─────────────────────────────────────── */
+#btn-run {
+  width: 100%;
+  background: linear-gradient(135deg, #c0392b, #f85149);
+  border: none;
+  border-radius: 8px;
+  color: #fff;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.5px;
+  padding: 10px;
+  cursor: pointer;
+  transition: opacity 0.15s, transform 0.1s;
+  margin-top: 6px;
+}
+#btn-run:hover   { opacity: 0.88; transform: translateY(-1px); }
+#btn-run:active  { transform: translateY(0px); }
+
+/* ── Metric tiles (top of right panel) ──────────────── */
+.metric-tile {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 10px;
+  padding: 10px 12px;
+  text-align: center;
+}
+.metric-tile .metric-val {
+  font-size: 26px;
+  font-weight: 800;
+  font-family: 'Courier New', monospace;
+  line-height: 1.1;
+}
+.metric-tile .metric-lbl {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  margin-top: 2px;
+  color: #8b949e;
+}
+.metric-tile.fatal  { border-color: #f8514960; }
+.metric-tile.severe { border-color: #d2992260; }
+.metric-tile.minor  { border-color: #388bfd60; }
+.metric-tile.struct { border-color: #8b949e60; }
+
+/* ── Cards ───────────────────────────────────────────── */
+.panel-card {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 10px;
+  overflow: hidden;
+}
+.panel-card .card-head {
+  padding: 8px 14px;
+  background: #21262d;
+  border-bottom: 1px solid #30363d;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: #8b949e;
+}
+.panel-card .card-body { padding: 10px; }
+
+/* ── Status chip ─────────────────────────────────────── */
+.status-idle    { color: #8b949e; font-size: 11px; }
+.status-ok      { color: #3fb950; font-size: 11px; font-weight: 600; }
+.status-error   { color: #f85149; font-size: 11px; font-weight: 600; }
+
+
+/* ── Loading overlay ─────────────────────────────────── */
+._dash-loading {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(13,17,23,0.65);
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+._dash-loading-callback {
+  position: fixed !important;
+  top: 44px;
+  right: 12px;
+  background: #388bfd20;
+  border: 1px solid #388bfd;
+  border-radius: 20px;
+  padding: 4px 14px;
+  color: #388bfd;
+  font-size: 11px;
+  font-weight: 600;
+  z-index: 9999;
+}
+
+/* ── Divider ─────────────────────────────────────────── */
+hr { border-color: #21262d; margin: 10px 0; }
+
+/* ── Alert (error display) ───────────────────────────── */
+.alert-danger {
+  background: #1c0a0a !important;
+  border: 1px solid #f8514960 !important;
+  color: #f85149 !important;
+  border-radius: 8px;
+  font-size: 11px;
+}
