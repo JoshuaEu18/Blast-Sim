@@ -25,6 +25,85 @@ from core.simulation import run_simulation
 from core.persons    import Person, assess_person_injuries
 from core.rescue     import Exit, RescueRoute, compute_rescue_routes, RESCUE_PRIORITY, PRIORITY_LABEL
 
+# ── FloorSpaceJS → blast-sim blueprint converter ──────────────────────────
+
+def parse_floorspacejs(data: dict) -> dict:
+    """
+    Convert an OpenStudio FloorSpaceJS JSON (from OpenStudio's floorspace.js editor)
+    into the blast-sim blueprint dict format.
+
+    FloorSpaceJS coordinates are in real-world units (feet by convention).
+    This function converts them to metres.
+    Each space polygon is approximated by its axis-aligned bounding box.
+    """
+    FT_TO_M = 0.3048
+    stories = data.get('stories', [])
+
+    floors = []
+    for story in stories:
+        fh_raw = story.get('floor_to_ceiling_height') or 10.0
+        fh_m = round(float(fh_raw) * FT_TO_M, 3)
+
+        geom       = story.get('geometry', {})
+        vertices_d = {v['id']: v for v in geom.get('vertices', [])}
+        edges_d    = {e['id']: e for e in geom.get('edges', [])}
+        faces_d    = {f['id']: f for f in geom.get('faces', [])}
+
+        rooms = []
+        for space in story.get('spaces', []):
+            face = faces_d.get(space.get('face_id', ''))
+            if not face:
+                continue
+            poly_x, poly_y = [], []
+            for eid, order in zip(face['edge_ids'], face['edge_order']):
+                e = edges_d.get(eid)
+                if not e:
+                    continue
+                v = vertices_d.get(e['vertex_ids'][int(order)])
+                if v:
+                    poly_x.append(float(v['x']))
+                    poly_y.append(float(v['y']))
+            if not poly_x:
+                continue
+            rooms.append({
+                'x_min': round(min(poly_x) * FT_TO_M, 3),
+                'x_max': round(max(poly_x) * FT_TO_M, 3),
+                'y_min': round(min(poly_y) * FT_TO_M, 3),
+                'y_max': round(max(poly_y) * FT_TO_M, 3),
+                'name':  space.get('name', f'Space_{space["id"]}'),
+            })
+
+        if rooms:
+            floors.append({'rooms': rooms, '_floor_height_m': fh_m})
+
+    if not floors:
+        raise ValueError('No stories with rooms found in FloorSpaceJS data.')
+
+    floor_heights = [f['_floor_height_m'] for f in floors]
+    default_fh    = floor_heights[0]
+
+    return {
+        'building': {
+            'n_floors':      len(floors),
+            'floor_height':  round(default_fh, 3),
+            'floor_heights': floor_heights,
+            'wall_material': 'concrete',
+            'window_frac':   0.25,
+            'total_occupants': 0,
+        },
+        'floors': [{'rooms': f['rooms']} for f in floors],
+        '_source': 'floorspacejs',
+    }
+
+
+def _auto_parse_blueprint(raw: dict) -> dict:
+    """Detect format and return a blast-sim blueprint dict."""
+    if 'stories' in raw:
+        return parse_floorspacejs(raw)
+    # Already in blast-sim format (has 'building' + 'floors')
+    return raw
+
+
 # ── Shared theme ───────────────────────────────────────────────────────────
 _BG     = '#0d1117'
 _BG2    = '#161b22'
@@ -207,8 +286,44 @@ def build_3d_figure(panels, columns, result=None, people_injuries=None, blast_po
         ))
         trace_groups.append('blast')
 
+    # ── Invisible 3D click grid (one layer per floor at standing height) ─────────
+    if panels:
+        xs_all = [float(c[0]) for p in panels for c in p.corners]
+        ys_all = [float(c[1]) for p in panels for c in p.corners]
+        x_lo, x_hi = min(xs_all), max(xs_all)
+        y_lo, y_hi = min(ys_all), max(ys_all)
+
+        floor_z_bots: dict = {}
+        for p in panels:
+            z_b = float(min(float(c[2]) for c in p.corners))
+            floor_z_bots[p.floor_idx] = min(floor_z_bots.get(p.floor_idx, 1e9), z_b)
+
+        step = 1.0
+        gx = np.arange(x_lo + 0.5, x_hi, step)
+        gy = np.arange(y_lo + 0.5, y_hi, step)
+        if len(gx) and len(gy):
+            xx, yy = np.meshgrid(gx, gy)
+            flat_x = xx.flatten(); flat_y = yy.flatten()
+            for fi, z_b in sorted(floor_z_bots.items()):
+                z_s = z_b + 1.2   # standing height ≈ 1.2 m
+                traces.append(go.Scatter3d(
+                    x=flat_x, y=flat_y, z=np.full(len(flat_x), z_s),
+                    mode='markers',
+                    marker=dict(size=8, color='rgba(0,0,0,0)', opacity=0),
+                    hovertemplate=(
+                        f'Floor {fi + 1}  ·  (%{{x:.1f}} m, %{{y:.1f}} m)<br>'
+                        '<i>Click to place person / exit</i><extra></extra>'
+                    ),
+                    customdata=np.column_stack([
+                        np.full(len(flat_x), fi),
+                        np.full(len(flat_x), z_s),
+                    ]),
+                    showlegend=False,
+                ))
+                trace_groups.append('click_grid')
+
     # ── Build visibility arrays for the filter dropdown ───────────────────────
-    _ALWAYS = {'legend', 'column', 'person', 'blast'}
+    _ALWAYS = {'legend', 'column', 'person', 'blast', 'click_grid'}
 
     def _vis(show_panel_types):
         return [True if (g in _ALWAYS or g in show_panel_types) else False
@@ -941,7 +1056,14 @@ def create_app():
                 metrics_row,
                 html.Div([
                     html.Div([
-                        html.Div('3D Structural Model', className='card-head'),
+                        html.Div([
+                            html.Span('3D Structural Model', className='card-head',
+                                      style={'display':'inline'}),
+                            html.Span('  ·  click floor to place 👤 / 🚪',
+                                      style={'fontSize':'9px','color':_MUTED,
+                                             'marginLeft':'8px'}),
+                        ], style={'display':'flex','alignItems':'center',
+                                  'padding':'4px 10px 2px'}),
                         dcc.Graph(id='graph-3d', style={'height':'calc(50vh - 30px)'},
                                   config={'displayModeBar':True,
                                           'modeBarButtonsToRemove':['toImage']}),
@@ -994,6 +1116,7 @@ def create_app():
         Output('blueprint-status', 'children'),
         Output('blueprint-status', 'style'),
         Output('bld-floors',       'value'),
+        Output('graph-3d',         'figure',   allow_duplicate=True),
         Input('blueprint-upload',     'contents'),
         Input('btn-clear-blueprint',  'n_clicks'),
         State('blueprint-upload',     'filename'),
@@ -1003,30 +1126,47 @@ def create_app():
     def manage_blueprint(contents, _clear, filename, current_floors):
         tid = ctx.triggered_id
         base_style = {'fontSize': '10px', 'marginBottom': '4px', 'minHeight': '14px'}
+        empty_3d   = _empty_fig('Upload a blueprint or run simulation.')
 
         if tid == 'btn-clear-blueprint':
-            return None, 'No blueprint loaded.', {**base_style, 'color': _MUTED}, current_floors
+            return None, 'No blueprint loaded.', {**base_style, 'color': _MUTED}, current_floors, empty_3d
 
         if not contents:
-            return no_update, no_update, no_update, no_update
+            return no_update, no_update, no_update, no_update, no_update
 
         try:
-            content_type, content_string = contents.split(',')
+            _, content_string = contents.split(',', 1)
             decoded = base64.b64decode(content_string).decode('utf-8')
-            bp = json.loads(decoded)
-            n_f = int(bp.get('building', {}).get('n_floors', current_floors or 3))
-            room_counts = [len(fd.get('rooms', [])) for fd in bp.get('floors', [])]
-            total_rooms = sum(room_counts)
-            status = f'Loaded: {filename}  ·  {n_f} floor(s)  ·  {total_rooms} room(s)'
-            return bp, status, {**base_style, 'color': _GREEN}, n_f
+            raw = json.loads(decoded)
+
+            # Auto-detect and convert format
+            bp = _auto_parse_blueprint(raw)
+
+            n_f         = int(bp['building']['n_floors'])
+            total_rooms = sum(len(fd.get('rooms', [])) for fd in bp.get('floors', []))
+            source_tag  = '  ·  FloorSpaceJS' if bp.get('_source') == 'floorspacejs' else ''
+            status      = f'✓  {filename}  ·  {n_f} floor(s)  ·  {total_rooms} room(s){source_tag}'
+
+            # Build 3D preview (no simulation)
+            try:
+                panels, columns, _ = create_building_from_blueprint(bp)
+                fig3d = build_3d_figure(panels, columns,
+                                        result=None, people_injuries=None, blast_pos=None)
+            except Exception as e3d:
+                fig3d = _empty_fig(f'3D preview error: {e3d}')
+
+            return bp, status, {**base_style, 'color': _GREEN}, n_f, fig3d
+
         except Exception as e:
-            return None, f'Error: {e}', {**base_style, 'color': _RED}, no_update
+            msg = str(e)[:120]
+            return None, f'⚠  {msg}', {**base_style, 'color': _RED}, no_update, no_update
 
     # ── People placement ────────────────────────────────────────────────────
 
     @app.callback(
         Output('people-store', 'data'),
         Input('floor-plan',       'clickData'),
+        Input('graph-3d',         'clickData'),
         Input('btn-add-person',   'n_clicks'),
         Input('btn-clear-people', 'n_clicks'),
         Input({'type':'person-del','index':ALL}, 'n_clicks'),
@@ -1036,22 +1176,40 @@ def create_app():
         State('place-mode',    'value'),
         prevent_initial_call=True,
     )
-    def manage_people(click_data, _add, _clear, _del_ns,
+    def manage_people(click_2d, click_3d, _add, _clear, _del_ns,
                       store, floor_idx, fh, place_mode):
         store = store or []
         tid   = ctx.triggered_id
 
         if tid == 'floor-plan':
             if (place_mode or 'person') != 'person':
-                return no_update      # clicking in exit mode — ignore for people
-            if not click_data:
                 return no_update
-            pts = click_data.get('points', [])
+            if not click_2d:
+                return no_update
+            pts = click_2d.get('points', [])
             if not pts:
                 return no_update
             x   = round(float(pts[0].get('x', 3.0)), 1)
             y   = round(float(pts[0].get('y', 3.0)), 1)
             z   = round(int(floor_idx or 0) * float(fh or 3.0) + 1.0, 1)
+            nid = max((p['id'] for p in store), default=-1) + 1
+            return store + [{'id':nid,'name':f'P{nid+1}','x':x,'y':y,'z':z,'mass_kg':70}]
+
+        if tid == 'graph-3d':
+            if (place_mode or 'person') != 'person':
+                return no_update
+            if not click_3d:
+                return no_update
+            pts = click_3d.get('points', [])
+            if not pts:
+                return no_update
+            pt = pts[0]
+            # Only accept clicks on our invisible grid (customdata present)
+            if 'customdata' not in pt:
+                return no_update
+            x   = round(float(pt.get('x', 3.0)), 1)
+            y   = round(float(pt.get('y', 3.0)), 1)
+            z   = round(float(pt.get('z', 1.2)), 1)
             nid = max((p['id'] for p in store), default=-1) + 1
             return store + [{'id':nid,'name':f'P{nid+1}','x':x,'y':y,'z':z,'mass_kg':70}]
 
@@ -1076,6 +1234,7 @@ def create_app():
     @app.callback(
         Output('exits-store', 'data'),
         Input('floor-plan',      'clickData'),
+        Input('graph-3d',        'clickData'),
         Input('btn-add-exit',    'n_clicks'),
         Input('btn-clear-exits', 'n_clicks'),
         Input({'type':'exit-del','index':ALL}, 'n_clicks'),
@@ -1085,24 +1244,43 @@ def create_app():
         State('place-mode',    'value'),
         prevent_initial_call=True,
     )
-    def manage_exits(click_data, _add, _clear, _del_ns,
+    def manage_exits(click_2d, click_3d, _add, _clear, _del_ns,
                      store, floor_idx, fh, place_mode):
         store = store or []
         tid   = ctx.triggered_id
 
         if tid == 'floor-plan':
             if (place_mode or 'person') != 'exit':
-                return no_update      # clicking in person mode — ignore for exits
-            if not click_data:
                 return no_update
-            pts = click_data.get('points', [])
+            if not click_2d:
+                return no_update
+            pts = click_2d.get('points', [])
             if not pts:
                 return no_update
-            x       = round(float(pts[0].get('x', 6.0)), 1)
-            y       = round(float(pts[0].get('y', 0.0)), 1)
-            fi      = int(floor_idx or 0)
-            z       = round(fi * float(fh or 3.0), 1)
-            nid     = max((e['id'] for e in store), default=-1) + 1
+            x   = round(float(pts[0].get('x', 6.0)), 1)
+            y   = round(float(pts[0].get('y', 0.0)), 1)
+            fi  = int(floor_idx or 0)
+            z   = round(fi * float(fh or 3.0), 1)
+            nid = max((e['id'] for e in store), default=-1) + 1
+            return store + [{'id':nid,'name':f'E{nid+1}','x':x,'y':y,'floor_idx':fi,'z':z}]
+
+        if tid == 'graph-3d':
+            if (place_mode or 'person') != 'exit':
+                return no_update
+            if not click_3d:
+                return no_update
+            pts = click_3d.get('points', [])
+            if not pts:
+                return no_update
+            pt = pts[0]
+            if 'customdata' not in pt:
+                return no_update
+            x   = round(float(pt.get('x', 6.0)), 1)
+            y   = round(float(pt.get('y', 0.0)), 1)
+            cd  = pt.get('customdata', [0, 0.0])
+            fi  = int(cd[0]) if cd else 0
+            z   = round(float(cd[1]) - 1.2, 1) if cd else 0.0   # floor z_bot
+            nid = max((e['id'] for e in store), default=-1) + 1
             return store + [{'id':nid,'name':f'E{nid+1}','x':x,'y':y,'floor_idx':fi,'z':z}]
 
         if tid == 'btn-add-exit':
@@ -1332,11 +1510,13 @@ def create_app():
                 tnt, bx, by, bz, btype, people_data, blueprint):
         try:
             if blueprint:
-                panels, columns, rooms = create_building_from_blueprint(blueprint)
-                bldg = blueprint.get('building', {})
+                # Re-parse in case the store holds raw FloorSpaceJS
+                bp = _auto_parse_blueprint(blueprint)
+                panels, columns, rooms = create_building_from_blueprint(bp)
+                bldg      = bp.get('building', {})
                 n_floors  = int(bldg.get('n_floors', n_floors or 3))
                 fh        = float(bldg.get('floor_height', fh or 3.0))
-                floor_defs = blueprint.get('floors', [])
+                floor_defs = bp.get('floors', [])
                 all_rooms  = [r for fd in floor_defs for r in fd.get('rooms', [])]
                 width  = max((r['x_max'] for r in all_rooms), default=float(width or 12))
                 depth  = max((r['y_max'] for r in all_rooms), default=float(depth or 10))

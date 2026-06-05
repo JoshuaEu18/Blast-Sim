@@ -494,6 +494,15 @@ def create_building_from_blueprint(blueprint: dict) -> Tuple[List[Panel], List[C
     total_room_count = sum(len(fd.get('rooms', [])) for fd in floor_defs[:n_floors])
     occ_per_room = max(1, total_occ // max(total_room_count, 1)) if total_occ > 0 else 0
 
+    # Per-floor heights: use list from blueprint when provided (e.g. FloorSpaceJS import)
+    _fh_list = bldg.get('floor_heights', None)
+    if _fh_list and len(_fh_list) >= n_floors:
+        floor_heights = [float(h) for h in _fh_list[:n_floors]]
+    else:
+        floor_heights = [fh] * n_floors
+    # Cumulative z_bot for each floor
+    z_bots = [sum(floor_heights[:i]) for i in range(n_floors)]
+
     panels:  List[Panel]  = []
     columns: List[Column] = []
     rooms:   List[Room]   = []
@@ -502,7 +511,8 @@ def create_building_from_blueprint(blueprint: dict) -> Tuple[List[Panel], List[C
     rid = 0
 
     for f in range(n_floors):
-        z_bot = f * fh
+        z_bot = z_bots[f]
+        fh    = floor_heights[f]   # shadow outer fh for this floor
         z_top = z_bot + fh
         fd    = floor_defs[min(f, len(floor_defs) - 1)]
         raw   = fd.get('rooms', [])
