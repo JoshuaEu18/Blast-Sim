@@ -1,6 +1,6 @@
 # Gas Leak Blast Damage Simulator — Project Summary
 
-*Last updated: 2026-05-28 (rev 7)*
+*Last updated: 2026-06-05 (rev 8)*
 
 A physics-based training simulator for engineers and emergency responders to
 evaluate structural damage and human casualties from indoor gas-leak explosions.
@@ -105,15 +105,23 @@ Two parallel models run simultaneously:
 Each wall/floor panel solved as an independent single-degree-of-freedom system:
 
 ```
-KLM · M · ÿ + C · ẏ + K · y = KL · P(t) · A
+Me · ÿ + C · ẏ + K · y = KL · P(t) · A
+  where  Me = KLM · ρ·A·t  (KLM = 0.55, set once in geometry.py)
+         KL = 0.53          (load transformation factor, fixed-fixed)
 ```
 
 - Integrated with `scipy.integrate.solve_ivp` (RK45)
-- Blast pressure interpolated from the Friedlander time history
+- Blast pressure interpolated from the Friedlander waveform. The coarse output
+  time step (dt = 0.5 ms) under-samples near-field pulses: at R < ~3 m the
+  positive-phase duration td can be shorter than dt, so the peak is missed
+  entirely on the coarse grid. When td < 10 · dt the simulation inserts a fine
+  sub-grid at td/20 resolution over the positive-phase window before building
+  the interpolant, ensuring near-field panels are not under-damaged relative to
+  far-field panels.
 - Panels sheltered from the blast receive 10% of the direct load
 - **Damage index** = peak displacement / yield displacement
-  - DI > 1 → yielded (structural damage)
-  - DI > μ → failed (element removed)
+  - DI ≥ 1 → yielded (structural damage)
+  - DI ≥ μ → failed (element removed)
 
 #### Shear-Building FEM (global lateral response)
 N-story lateral model with inter-story stiffness from column `12EI/h³`:
@@ -128,7 +136,7 @@ N-story lateral model with inter-story stiffness from column `12EI/h³`:
 - Limit states: Life Safety > 2.5%, Collapse prevention > 5.0%
 
 #### Interior Blast Propagation
-- Failed exterior panels → interior room pressure = 50% of exterior `Pso`
+- Failed exterior panels → interior room pressure = 50% of exterior `Pso` (incident side-on overpressure, not reflected pressure)
 - Intact exterior panels → 5% leakage (cracks, gaps)
 - Failed interior walls → 80% pressure transmission to adjacent room
 
@@ -308,6 +316,7 @@ All numeric parameters (building dimensions, blast position, TNT mass, etc.) use
 20. **Panel Response tab removed** — The right-panel `dbc.Tabs` wrapper and Panel Response tab (pressure/displacement time history of the most-damaged panel) have been removed. Error tracebacks from the simulation callback are printed to the server console instead of the UI.
 21. **Metric tiles show actual person counts** — Fatal, Severe Inj., and Minor Inj. tiles show the count of individually placed people at that severity level, not statistical room-occupancy percentages.
 22. **3D view — per-type colour coding and filter dropdown** — Each panel type (exterior wall, interior wall, window, floor/roof) now uses a distinct colour family so damage to different structural elements is immediately distinguishable. Windows use low opacity (22%) when intact and higher opacity (55%) when failed. A legend is shown in the top-left of the 3D view. Hover text now includes material name, panel dimensions, thickness, and DI.
+24. **Interior-wall sheltered-side check** — each interior partition is assigned a single outward normal (+x or +y). The sheltered-side heuristic (10% load when the blast is behind the normal direction) is therefore orientation-dependent; the same interior wall receives full direct load from one room and 10% from the other. Interior loads are predominantly driven by the interior-pressure propagation model rather than direct SDOF integration, so the impact on final room pressures is small, but the SDOF damage index for individual interior panels can be asymmetric.
 23. **Exits & rescue routes** — `core/rescue.py` implements Dijkstra pathfinding through a room-adjacency graph. Edge costs: intact wall = 1.0, damaged (DI ≥ 0.5) = 2.0, failed wall = 5.0. Exits are placed by the user on the floor plan (in Exit mode). After simulation the Rescue Plan tab shows priority-ordered routes (1 Immediate → 5 Expectant) and dotted route lines are drawn on the floor plan. Room data (`x_min`, `x_max`, `y_min`, `y_max`, `floor_idx`, `z_bot`, `z_top`) is serialised into `sim-store` so routes can be re-computed whenever exits or people change without re-running the simulation. Panel `room_inside` / `room_outside` IDs are also stored so the graph builder can identify which rooms each interior wall connects.
 
 ---

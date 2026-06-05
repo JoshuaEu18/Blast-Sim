@@ -21,7 +21,7 @@ import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.interpolate import interp1d
 
-from .blast import BlastSource
+from .blast import BlastSource, friedlander
 from .geometry import Panel, Column, Room
 from .materials import Material
 
@@ -87,20 +87,37 @@ def _integrate_panel(panel: Panel, blast: BlastSource,
     r = panel.center - blast.pos
     n = panel.normal
     facing = float(np.dot(-r / max(np.linalg.norm(r), 0.1), n))
-    if facing < -0.1:
-        pressure_arr = pressure_arr * 0.1
 
-    KL  = 0.53    # load transformation factor (fixed-fixed)
-    KLM = 0.52    # mass-to-load factor
-
+    KL = 0.53    # load transformation factor (fixed-fixed)
     Ke = panel.Ke
-    Me = panel.Me * KLM          # effective inertia already embedded in omega_n
+    Me = panel.Me    # equivalent mass already includes KLM (computed in geometry.py)
     Ce = panel.Ce
     A  = panel.area
 
-    # Force per unit displacement: use interp1d for RHS
-    P_interp = interp1d(t_arr, pressure_arr * 1e3,  # kPa → Pa
-                        kind='linear', bounds_error=False, fill_value=0.0)
+    # Build pressure interpolant. For near-field blasts the positive-phase
+    # duration td can be shorter than dt_out (0.5 ms), meaning the entire
+    # blast pulse falls between two coarse time steps and is never sampled.
+    # When td < 10·dt, insert a fine sub-grid over the positive-phase window
+    # (td/20 resolution) so the peak is captured correctly.
+    facing_factor = 0.1 if facing < -0.1 else 1.0
+    dt_out = float(t_arr[1] - t_arr[0]) if len(t_arr) > 1 else 5e-4
+    td_s   = meta['td_ms'] * 1e-3
+    if td_s < 10.0 * dt_out:
+        toa_s   = meta['toa_s']
+        dt_fine = max(td_s / 20.0, dt_out / 10.0)
+        t_w0    = max(t_arr[0], toa_s)
+        t_w1    = min(t_arr[-1], toa_s + td_s * 1.5)
+        t_fine  = np.arange(t_w0, t_w1 + dt_fine, dt_fine)
+        t_comb  = np.unique(np.concatenate([t_arr, t_fine]))
+        t_sh    = (t_comb - toa_s) * 1e3          # shifted to ms for Friedlander
+        p_comb  = friedlander(t_sh, meta['Pr'], meta['td_ms'], meta['b']) * facing_factor
+        P_interp = interp1d(t_comb, p_comb * 1e3,
+                            kind='linear', bounds_error=False, fill_value=0.0)
+        peak_p = float(np.max(p_comb))
+    else:
+        P_interp = interp1d(t_arr, pressure_arr * 1e3,
+                            kind='linear', bounds_error=False, fill_value=0.0)
+        peak_p = float(np.max(pressure_arr))
 
     def ode(t, y):
         x, v = y
@@ -114,9 +131,9 @@ def _integrate_panel(panel: Panel, blast: BlastSource,
 
     disp = sol.y[0]
     vel  = sol.y[1]
-    peak = float(np.max(np.abs(disp)))
-    di   = peak / max(panel.yield_disp, 1e-12)
-    failed = peak >= panel.fail_disp
+    peak_d = float(np.max(np.abs(disp)))
+    di     = peak_d / max(panel.yield_disp, 1e-12)
+    failed = peak_d >= panel.fail_disp
 
     t_fail = np.inf
     if failed:
@@ -130,8 +147,8 @@ def _integrate_panel(panel: Panel, blast: BlastSource,
         displacement=disp,
         velocity=vel,
         blast_pressure=pressure_arr,
-        peak_pressure=float(np.max(pressure_arr)),
-        peak_displacement=peak,
+        peak_pressure=peak_p,
+        peak_displacement=peak_d,
         damage_index=di,
         failed=failed,
         failure_time=t_fail,
@@ -268,8 +285,10 @@ def _interior_pressure(rooms: List[Room], panels: List[Panel],
             panel = panels[pid]
             is_ext = panel.panel_type in ('ext_wall', 'window')
             if is_ext:
+                # Use incident side-on Pso (not reflected Pr) for interior pressure
+                pso_val = pr.meta.get('Pso', pr.peak_pressure)
                 factor = 0.5 if pr.failed else 0.05
-                p_in = max(p_in, pr.peak_pressure * factor)
+                p_in = max(p_in, pso_val * factor)
             else:
                 # Interior panel – propagate from adjacent room if it failed
                 # (simplified: just carry 80% of neighbour's interior pressure)
