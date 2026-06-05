@@ -432,3 +432,256 @@ def create_building(
             rooms[p.room_outside].panel_ids.append(p.id)
 
     return panels, columns, rooms
+
+
+# ---------------------------------------------------------------------------
+# Blueprint-driven building generator
+# ---------------------------------------------------------------------------
+
+def create_building_from_blueprint(blueprint: dict) -> Tuple[List[Panel], List[Column], List[Room]]:
+    """
+    Build panels, columns, and rooms from a user-supplied JSON blueprint.
+
+    Blueprint format::
+
+        {
+          "building": {
+            "n_floors": 2, "floor_height": 3.0,
+            "wall_thickness": 0.20, "floor_thickness": 0.25, "col_size": 0.40,
+            "wall_material": "concrete",   // concrete | brick | steel_plate
+            "window_frac": 0.30, "total_occupants": 0
+          },
+          "floors": [
+            {
+              "rooms": [
+                {"x_min": 0, "x_max": 5,  "y_min": 0, "y_max": 4,  "name": "Room A"},
+                {"x_min": 5, "x_max": 12, "y_min": 0, "y_max": 4,  "name": "Room B"},
+                {"x_min": 0, "x_max": 12, "y_min": 4, "y_max": 10, "name": "Room C"}
+              ]
+            }
+          ]
+        }
+
+    If fewer floor definitions are provided than ``n_floors``, the last floor
+    layout is repeated for all remaining floors.  Room coordinates must start
+    at (0, 0).  Rooms should be axis-aligned rectangles that tile the footprint
+    without gaps or overlaps.
+    """
+    from .materials import CONCRETE, BRICK, STEEL_PLATE, STEEL_STRUCTURAL, GLASS as _GLASS
+
+    _MATS = {
+        'concrete': CONCRETE, 'brick': BRICK,
+        'steel_plate': STEEL_PLATE, 'steel_structural': STEEL_STRUCTURAL,
+    }
+
+    bldg      = blueprint.get('building', {})
+    n_floors  = int(bldg.get('n_floors', 1))
+    fh        = float(bldg.get('floor_height', 3.0))
+    wall_t    = float(bldg.get('wall_thickness', 0.20))
+    floor_t   = float(bldg.get('floor_thickness', 0.25))
+    col_size  = float(bldg.get('col_size', 0.40))
+    win_frac  = float(bldg.get('window_frac', 0.30))
+    wall_mat  = _MATS.get(bldg.get('wall_material',  'concrete'), CONCRETE)
+    floor_mat = _MATS.get(bldg.get('floor_material', 'concrete'), CONCRETE)
+    col_mat   = _MATS.get(bldg.get('col_material',   'steel_structural'), STEEL_STRUCTURAL)
+    glass_mat = _GLASS
+    total_occ = int(bldg.get('total_occupants', 0))
+
+    floor_defs = list(blueprint.get('floors', [{'rooms': []}]))
+    while len(floor_defs) < n_floors:
+        floor_defs.append(floor_defs[-1])
+
+    total_room_count = sum(len(fd.get('rooms', [])) for fd in floor_defs[:n_floors])
+    occ_per_room = max(1, total_occ // max(total_room_count, 1)) if total_occ > 0 else 0
+
+    panels:  List[Panel]  = []
+    columns: List[Column] = []
+    rooms:   List[Room]   = []
+    pid = 0
+    cid = 0
+    rid = 0
+
+    for f in range(n_floors):
+        z_bot = f * fh
+        z_top = z_bot + fh
+        fd    = floor_defs[min(f, len(floor_defs) - 1)]
+        raw   = fd.get('rooms', [])
+        if not raw:
+            continue
+
+        # ── Room objects ──────────────────────────────────────────────────────
+        room_key_to_rid: dict = {}   # (x0,x1,y0,y1) → global rid
+        for rdata in raw:
+            x0 = round(float(rdata['x_min']), 6)
+            x1 = round(float(rdata['x_max']), 6)
+            y0 = round(float(rdata['y_min']), 6)
+            y1 = round(float(rdata['y_max']), 6)
+            rooms.append(Room(id=rid, floor_idx=f,
+                              x_min=x0, x_max=x1, y_min=y0, y_max=y1,
+                              z_bot=z_bot, z_top=z_top,
+                              n_occupants=occ_per_room))
+            room_key_to_rid[(x0, x1, y0, y1)] = rid
+            rid += 1
+
+        # ── Grid lines from room corners ──────────────────────────────────────
+        xs = sorted({round(float(r['x_min']), 6) for r in raw} |
+                    {round(float(r['x_max']), 6) for r in raw})
+        ys = sorted({round(float(r['y_min']), 6) for r in raw} |
+                    {round(float(r['y_max']), 6) for r in raw})
+
+        bx0, bx1 = xs[0], xs[-1]
+        by0, by1 = ys[0], ys[-1]
+
+        # ── Cell → room lookup (by cell centre) ───────────────────────────────
+        def _cell_room(ix: int, iy: int):
+            if ix < 0 or ix >= len(xs) - 1 or iy < 0 or iy >= len(ys) - 1:
+                return None
+            cx = (xs[ix] + xs[ix + 1]) / 2.0
+            cy = (ys[iy] + ys[iy + 1]) / 2.0
+            for rdata in raw:
+                rx0 = float(rdata['x_min']); rx1 = float(rdata['x_max'])
+                ry0 = float(rdata['y_min']); ry1 = float(rdata['y_max'])
+                if rx0 - 1e-6 <= cx <= rx1 + 1e-6 and ry0 - 1e-6 <= cy <= ry1 + 1e-6:
+                    key = (round(rx0,6), round(rx1,6), round(ry0,6), round(ry1,6))
+                    return room_key_to_rid.get(key)
+            return None
+
+        c2r = {(ix, iy): _cell_room(ix, iy)
+               for ix in range(len(xs) - 1)
+               for iy in range(len(ys) - 1)}
+
+        # ── Vertical walls at each x-grid line ────────────────────────────────
+        for i, x in enumerate(xs):
+            for iy in range(len(ys) - 1):
+                seg_y0 = ys[iy]; seg_y1 = ys[iy + 1]
+                span   = seg_y1 - seg_y0
+
+                left  = c2r.get((i - 1, iy))
+                right = c2r.get((i,     iy))
+
+                if left is None and right is None:
+                    continue
+                if left == right:
+                    continue
+
+                if left is None:
+                    nrm = np.array([-1., 0., 0.]); room_in = right; room_out = -1; ext = True
+                elif right is None:
+                    nrm = np.array([ 1., 0., 0.]); room_in = left;  room_out = -1; ext = True
+                else:
+                    nrm = np.array([ 1., 0., 0.]); room_in = right; room_out = left; ext = False
+
+                corners = np.array([[x, seg_y0, z_bot], [x, seg_y1, z_bot],
+                                    [x, seg_y1, z_top], [x, seg_y0, z_top]], dtype=float)
+                center  = corners.mean(axis=0)
+                area_t  = span * fh
+                thick   = wall_t if ext else wall_t * 0.8
+                ptype   = 'ext_wall' if ext else 'int_wall'
+
+                p = Panel(id=pid, panel_type=ptype, corners=corners, center=center,
+                          normal=nrm, width=span, height=fh,
+                          area=area_t * (1.0 - win_frac if ext else 1.0),
+                          thickness=thick, material=wall_mat, floor_idx=f,
+                          room_inside=room_in, room_outside=room_out)
+                _sdof_properties(p); panels.append(p); pid += 1
+
+                if ext and win_frac > 0.0:
+                    pw = Panel(id=pid, panel_type='window',
+                               corners=corners.copy(), center=center.copy(),
+                               normal=nrm.copy(),
+                               width=span * np.sqrt(win_frac), height=fh * np.sqrt(win_frac),
+                               area=area_t * win_frac, thickness=0.006,
+                               material=glass_mat, floor_idx=f,
+                               room_inside=room_in, room_outside=-1)
+                    _sdof_properties(pw); panels.append(pw); pid += 1
+
+        # ── Horizontal walls at each y-grid line ──────────────────────────────
+        for j, y in enumerate(ys):
+            for ix in range(len(xs) - 1):
+                seg_x0 = xs[ix]; seg_x1 = xs[ix + 1]
+                span   = seg_x1 - seg_x0
+
+                below = c2r.get((ix, j - 1))
+                above = c2r.get((ix, j))
+
+                if below is None and above is None:
+                    continue
+                if below == above:
+                    continue
+
+                if below is None:
+                    nrm = np.array([0., -1., 0.]); room_in = above; room_out = -1; ext = True
+                elif above is None:
+                    nrm = np.array([0.,  1., 0.]); room_in = below; room_out = -1; ext = True
+                else:
+                    nrm = np.array([0.,  1., 0.]); room_in = above; room_out = below; ext = False
+
+                corners = np.array([[seg_x0, y, z_bot], [seg_x1, y, z_bot],
+                                    [seg_x1, y, z_top], [seg_x0, y, z_top]], dtype=float)
+                center  = corners.mean(axis=0)
+                area_t  = span * fh
+                thick   = wall_t if ext else wall_t * 0.8
+                ptype   = 'ext_wall' if ext else 'int_wall'
+
+                p = Panel(id=pid, panel_type=ptype, corners=corners, center=center,
+                          normal=nrm, width=span, height=fh,
+                          area=area_t * (1.0 - win_frac if ext else 1.0),
+                          thickness=thick, material=wall_mat, floor_idx=f,
+                          room_inside=room_in, room_outside=room_out)
+                _sdof_properties(p); panels.append(p); pid += 1
+
+                if ext and win_frac > 0.0:
+                    pw = Panel(id=pid, panel_type='window',
+                               corners=corners.copy(), center=center.copy(),
+                               normal=nrm.copy(),
+                               width=span * np.sqrt(win_frac), height=fh * np.sqrt(win_frac),
+                               area=area_t * win_frac, thickness=0.006,
+                               material=glass_mat, floor_idx=f,
+                               room_inside=room_in, room_outside=-1)
+                    _sdof_properties(pw); panels.append(pw); pid += 1
+
+        # ── Floor slab and Roof ────────────────────────────────────────────────
+        if f > 0:
+            p = Panel(id=pid, panel_type='floor',
+                      corners=np.array([[bx0,bx1,bx1,bx0], [by0,by0,by1,by1],
+                                        [z_bot]*4], dtype=float).T,
+                      center=np.array([(bx0+bx1)/2, (by0+by1)/2, z_bot]),
+                      normal=np.array([0.,0.,-1.]),
+                      width=bx1-bx0, height=by1-by0,
+                      area=(bx1-bx0)*(by1-by0), thickness=floor_t,
+                      material=floor_mat, floor_idx=f, room_inside=-1, room_outside=-1)
+            _sdof_properties(p); panels.append(p); pid += 1
+
+        if f == n_floors - 1:
+            p = Panel(id=pid, panel_type='roof',
+                      corners=np.array([[bx0,bx1,bx1,bx0], [by0,by0,by1,by1],
+                                        [z_top]*4], dtype=float).T,
+                      center=np.array([(bx0+bx1)/2, (by0+by1)/2, z_top]),
+                      normal=np.array([0.,0.,1.]),
+                      width=bx1-bx0, height=by1-by0,
+                      area=(bx1-bx0)*(by1-by0), thickness=floor_t,
+                      material=floor_mat, floor_idx=f, room_inside=-1, room_outside=-1)
+            _sdof_properties(p); panels.append(p); pid += 1
+
+        # ── Columns at grid corners that touch at least one room ───────────────
+        for xi in range(len(xs)):
+            for yi in range(len(ys)):
+                adj = [c2r.get((xi - 1, yi - 1)), c2r.get((xi, yi - 1)),
+                       c2r.get((xi - 1, yi)),     c2r.get((xi, yi))]
+                if not any(r is not None for r in adj):
+                    continue
+                col = Column(id=cid,
+                             base=np.array([xs[xi], ys[yi], z_bot]),
+                             top=np.array([xs[xi], ys[yi], z_top]),
+                             height=fh, material=col_mat, b=col_size, d=col_size)
+                _column_capacities(col)
+                columns.append(col); cid += 1
+
+    # Assign panels to rooms
+    for p in panels:
+        if p.room_inside >= 0:
+            rooms[p.room_inside].panel_ids.append(p.id)
+        if p.room_outside >= 0:
+            rooms[p.room_outside].panel_ids.append(p.id)
+
+    return panels, columns, rooms

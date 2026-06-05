@@ -100,6 +100,7 @@ def _integrate_panel(panel: Panel, blast: BlastSource,
     # When td < 10·dt, insert a fine sub-grid over the positive-phase window
     # (td/20 resolution) so the peak is captured correctly.
     facing_factor = 0.1 if facing < -0.1 else 1.0
+    pressure_arr  = pressure_arr * facing_factor   # apply once; used by both paths
     dt_out = float(t_arr[1] - t_arr[0]) if len(t_arr) > 1 else 5e-4
     td_s   = meta['td_ms'] * 1e-3
     if td_s < 10.0 * dt_out:

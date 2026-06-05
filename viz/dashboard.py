@@ -3,6 +3,7 @@ Blast Damage Simulator – Plotly Dash UI.
 Run via:  python main.py  →  http://127.0.0.1:8050
 """
 
+import base64
 import json
 import traceback
 from types import SimpleNamespace
@@ -18,7 +19,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.materials  import MATERIALS
-from core.geometry   import create_building
+from core.geometry   import create_building, create_building_from_blueprint
 from core.blast      import BlastSource
 from core.simulation import run_simulation
 from core.persons    import Person, assess_person_injuries
@@ -268,30 +269,43 @@ def build_3d_figure(panels, columns, result=None, people_injuries=None, blast_po
 def build_floor_plan(width, depth, n_rooms_x, n_rooms_y, floor_idx, floor_height,
                      blast_pos, people, people_injuries=None,
                      exits=None, place_mode='person',
-                     rescue_routes=None, rooms_data=None):
+                     rescue_routes=None, rooms_data=None,
+                     blueprint_rooms=None):
     """
     Top-down 2D floor plan.
 
-    New parameters:
-      exits         : list of exit dicts from exits-store
-      place_mode    : 'person' | 'exit' — changes click hint text
-      rescue_routes : list of route dicts (from rescue-routes-store) for path lines
-      rooms_data    : list of room dicts from sim-store, used for route waypoints
+    Parameters:
+      exits          : list of exit dicts from exits-store
+      place_mode     : 'person' | 'exit' — changes click hint text
+      rescue_routes  : list of route dicts (from rescue-routes-store) for path lines
+      rooms_data     : list of room dicts from sim-store, used for route waypoints
+      blueprint_rooms: list of room dicts from blueprint JSON for the current floor;
+                       when provided, draws actual room shapes instead of a uniform grid
     """
-    xs = np.linspace(0, width, n_rooms_x + 1)
-    ys = np.linspace(0, depth, n_rooms_y + 1)
-
     shapes = []
-    for xi in range(n_rooms_x):
-        for yi in range(n_rooms_y):
+    if blueprint_rooms:
+        for room in blueprint_rooms:
             shapes.append(dict(
                 type='rect',
-                x0=float(xs[xi]), x1=float(xs[xi+1]),
-                y0=float(ys[yi]), y1=float(ys[yi+1]),
-                line=dict(color='#3d444d', width=1),
+                x0=float(room['x_min']), x1=float(room['x_max']),
+                y0=float(room['y_min']), y1=float(room['y_max']),
+                line=dict(color='#388bfd', width=1.5),
                 fillcolor='#161b22',
                 layer='below',
             ))
+    else:
+        xs = np.linspace(0, width, n_rooms_x + 1)
+        ys = np.linspace(0, depth, n_rooms_y + 1)
+        for xi in range(n_rooms_x):
+            for yi in range(n_rooms_y):
+                shapes.append(dict(
+                    type='rect',
+                    x0=float(xs[xi]), x1=float(xs[xi+1]),
+                    y0=float(ys[yi]), y1=float(ys[yi+1]),
+                    line=dict(color='#3d444d', width=1),
+                    fillcolor='#161b22',
+                    layer='below',
+                ))
 
     traces = []
 
@@ -423,12 +437,21 @@ def build_floor_plan(width, depth, n_rooms_x, n_rooms_y, floor_idx, floor_height
         showlegend=False,
     ))
 
+    if blueprint_rooms:
+        all_x = [float(r['x_min']) for r in blueprint_rooms] + [float(r['x_max']) for r in blueprint_rooms]
+        all_y = [float(r['y_min']) for r in blueprint_rooms] + [float(r['y_max']) for r in blueprint_rooms]
+        x_range = [min(all_x) - 0.5, max(all_x) + 0.5]
+        y_range = [min(all_y) - 0.5, max(all_y) + 0.5]
+    else:
+        x_range = [-0.5, width + 0.5]
+        y_range = [-0.5, depth + 0.5]
+
     fig = go.Figure(data=traces)
     fig.update_layout(
         **_layout(margin=dict(l=4, r=4, t=4, b=4)),
         shapes=shapes,
-        xaxis=dict(range=[-0.5, width+0.5], showgrid=False, color=_MUTED, zeroline=False),
-        yaxis=dict(range=[-0.5, depth+0.5], showgrid=False, color=_MUTED, zeroline=False),
+        xaxis=dict(range=x_range, showgrid=False, color=_MUTED, zeroline=False),
+        yaxis=dict(range=y_range, showgrid=False, color=_MUTED, zeroline=False),
         showlegend=False,
         clickmode='event+select',
         dragmode='pan',
@@ -766,6 +789,32 @@ def create_app():
         ], className='g-1'),
         _numbox('bld-wf', 'Window frac.', 0, 0.7, 0.05, 0.30),
 
+        # ── Blueprint upload ───────────────────────────────────────────────────
+        html.Div('Blueprint JSON', className='section-label accent-blue'),
+        dcc.Upload(
+            id='blueprint-upload',
+            children=html.Div([
+                html.Span('Drag & drop or '),
+                html.A('select a JSON file', style={'color': _BLUE, 'cursor': 'pointer'}),
+            ], style={'fontSize': '11px', 'color': _MUTED, 'textAlign': 'center',
+                      'padding': '8px 4px'}),
+            style={
+                'border': f'1px dashed {_GRID}',
+                'borderRadius': '6px',
+                'background': '#0d1117',
+                'marginBottom': '4px',
+                'cursor': 'pointer',
+            },
+            multiple=False,
+        ),
+        html.Div(id='blueprint-status',
+                 style={'fontSize': '10px', 'color': _MUTED, 'marginBottom': '4px',
+                        'minHeight': '14px'}),
+        html.Button('Clear Blueprint', id='btn-clear-blueprint', n_clicks=0,
+                    style={'background': 'none', 'border': f'1px solid {_GRID}',
+                           'color': _MUTED, 'borderRadius': '5px', 'padding': '3px 8px',
+                           'fontSize': '10px', 'cursor': 'pointer', 'marginBottom': '6px'}),
+
         html.Div('Blast Source', className='section-label accent-red'),
         _numbox('blast-tnt', 'TNT equivalent (kg)', 1, 500, 1, 25),
         dbc.Row([
@@ -916,6 +965,7 @@ def create_app():
         dcc.Store(id='people-store',        data=[]),
         dcc.Store(id='exits-store',         data=[]),
         dcc.Store(id='rescue-routes-store', data=[]),
+        dcc.Store(id='blueprint-store',     data=None),
     ])
 
     # ── Callbacks ──────────────────────────────────────────────────────────
@@ -923,14 +973,54 @@ def create_app():
     @app.callback(
         Output('floor-selector', 'options'),
         Output('floor-selector', 'value'),
-        Input('bld-floors', 'value'),
-        State('floor-selector', 'value'),
+        Input('bld-floors',      'value'),
+        Input('blueprint-store', 'data'),
+        State('floor-selector',  'value'),
     )
-    def sync_floor_selector(n_floors, current):
-        n    = int(n_floors or 3)
+    def sync_floor_selector(n_floors, blueprint, current):
+        if blueprint:
+            bldg = blueprint.get('building', {})
+            n = int(bldg.get('n_floors', n_floors or 3))
+        else:
+            n = int(n_floors or 3)
         opts = [{'label': f'Floor {i + 1}', 'value': i} for i in range(n)]
         val  = min(int(current or 0), n - 1)
         return opts, val
+
+    # ── Blueprint management ─────────────────────────────────────────────────
+
+    @app.callback(
+        Output('blueprint-store',  'data'),
+        Output('blueprint-status', 'children'),
+        Output('blueprint-status', 'style'),
+        Output('bld-floors',       'value'),
+        Input('blueprint-upload',     'contents'),
+        Input('btn-clear-blueprint',  'n_clicks'),
+        State('blueprint-upload',     'filename'),
+        State('bld-floors',           'value'),
+        prevent_initial_call=True,
+    )
+    def manage_blueprint(contents, _clear, filename, current_floors):
+        tid = ctx.triggered_id
+        base_style = {'fontSize': '10px', 'marginBottom': '4px', 'minHeight': '14px'}
+
+        if tid == 'btn-clear-blueprint':
+            return None, 'No blueprint loaded.', {**base_style, 'color': _MUTED}, current_floors
+
+        if not contents:
+            return no_update, no_update, no_update, no_update
+
+        try:
+            content_type, content_string = contents.split(',')
+            decoded = base64.b64decode(content_string).decode('utf-8')
+            bp = json.loads(decoded)
+            n_f = int(bp.get('building', {}).get('n_floors', current_floors or 3))
+            room_counts = [len(fd.get('rooms', [])) for fd in bp.get('floors', [])]
+            total_rooms = sum(room_counts)
+            status = f'Loaded: {filename}  ·  {n_f} floor(s)  ·  {total_rooms} room(s)'
+            return bp, status, {**base_style, 'color': _GREEN}, n_f
+        except Exception as e:
+            return None, f'Error: {e}', {**base_style, 'color': _RED}, no_update
 
     # ── People placement ────────────────────────────────────────────────────
 
@@ -1043,6 +1133,7 @@ def create_app():
         Input('floor-selector',      'value'),
         Input('exits-store',         'data'),
         Input('rescue-routes-store', 'data'),
+        Input('blueprint-store',     'data'),
         State('bld-width',  'value'), State('bld-depth',  'value'),
         State('bld-floors', 'value'), State('bld-fh',     'value'),
         State('bld-rx',     'value'), State('bld-ry',     'value'),
@@ -1052,7 +1143,7 @@ def create_app():
         prevent_initial_call=False,
     )
     def update_plan_ui(people, sim_store, floor_idx, exits_data, rescue_routes,
-                       width, depth, n_floors, fh, n_rx, n_ry, bx, by, bz,
+                       blueprint, width, depth, n_floors, fh, n_rx, n_ry, bx, by, bz,
                        place_mode):
         people       = people       or []
         exits_data   = exits_data   or []
@@ -1060,6 +1151,23 @@ def create_app():
 
         people_injuries = _get_people_injuries(people, sim_store)
         rooms_data      = (sim_store or {}).get('rooms', [])
+
+        # When a blueprint is loaded, derive dimensions from it
+        blueprint_rooms = None
+        if blueprint:
+            bldg = blueprint.get('building', {})
+            fh   = float(bldg.get('floor_height', fh or 3.0))
+            fi   = int(floor_idx or 0)
+            floor_defs = blueprint.get('floors', [])
+            if fi < len(floor_defs):
+                blueprint_rooms = floor_defs[fi].get('rooms', [])
+            elif floor_defs:
+                blueprint_rooms = floor_defs[-1].get('rooms', [])
+            if blueprint_rooms:
+                all_x = [r['x_max'] for r in blueprint_rooms]
+                all_y = [r['y_max'] for r in blueprint_rooms]
+                width = max(all_x)
+                depth = max(all_y)
 
         blast_pos = np.array([float(bx or 6), float(by or -3), float(bz or 0.5)])
         fp = build_floor_plan(
@@ -1072,6 +1180,7 @@ def create_app():
             place_mode=place_mode or 'person',
             rescue_routes=rescue_routes,
             rooms_data=rooms_data,
+            blueprint_rooms=blueprint_rooms,
         )
         return render_people_list(people), fp, render_exits_list(exits_data)
 
@@ -1214,22 +1323,33 @@ def create_app():
         State('blast-tnt',  'value'),
         State('blast-x',    'value'), State('blast-y',    'value'),
         State('blast-z',    'value'), State('blast-type', 'value'),
-        State('people-store', 'data'),
+        State('people-store',    'data'),
+        State('blueprint-store', 'data'),
         prevent_initial_call=True,
     )
     def run_sim(n_clicks,
                 width, depth, n_floors, fh, mat_key, n_rx, n_ry, wfrac,
-                tnt, bx, by, bz, btype, people_data):
+                tnt, bx, by, bz, btype, people_data, blueprint):
         try:
-            wall_mat = MATERIALS.get(mat_key or 'concrete')
-            panels, columns, rooms = create_building(
-                width=float(width or 12), depth=float(depth or 10),
-                n_floors=int(n_floors or 3), floor_height=float(fh or 3),
-                wall_mat=wall_mat,
-                n_rooms_x=int(n_rx or 2), n_rooms_y=int(n_ry or 2),
-                window_frac=float(wfrac or 0.3),
-                total_occupants=0,
-            )
+            if blueprint:
+                panels, columns, rooms = create_building_from_blueprint(blueprint)
+                bldg = blueprint.get('building', {})
+                n_floors  = int(bldg.get('n_floors', n_floors or 3))
+                fh        = float(bldg.get('floor_height', fh or 3.0))
+                floor_defs = blueprint.get('floors', [])
+                all_rooms  = [r for fd in floor_defs for r in fd.get('rooms', [])]
+                width  = max((r['x_max'] for r in all_rooms), default=float(width or 12))
+                depth  = max((r['y_max'] for r in all_rooms), default=float(depth or 10))
+            else:
+                wall_mat = MATERIALS.get(mat_key or 'concrete')
+                panels, columns, rooms = create_building(
+                    width=float(width or 12), depth=float(depth or 10),
+                    n_floors=int(n_floors or 3), floor_height=float(fh or 3),
+                    wall_mat=wall_mat,
+                    n_rooms_x=int(n_rx or 2), n_rooms_y=int(n_ry or 2),
+                    window_frac=float(wfrac or 0.3),
+                    total_occupants=0,
+                )
             blast = BlastSource(
                 x=float(bx or 6), y=float(by or -3), z=float(bz or 0.5),
                 tnt_kg=float(tnt or 25), burst_type=btype or 'surface',
