@@ -1,6 +1,6 @@
 # Gas Leak Blast Damage Simulator — Project Summary
 
-*Last updated: 2026-06-05 (rev 8)*
+*Last updated: 2026-06-05 (rev 11)*
 
 A physics-based training simulator for engineers and emergency responders to
 evaluate structural damage and human casualties from indoor gas-leak explosions.
@@ -32,7 +32,7 @@ blast_sim/
 │   ├── persons.py        # Individual person injury assessment
 │   └── rescue.py         # Dijkstra rescue-route pathfinding through room graph
 ├── viz/
-│   └── dashboard.py      # Plotly Dash interactive UI (~950 lines)
+│   └── dashboard.py      # Plotly Dash interactive UI (~1 600 lines)
 ├── assets/
 │   └── style.css         # Custom dark-theme stylesheet
 ├── main.py               # Entry point
@@ -40,7 +40,7 @@ blast_sim/
 └── requirements.txt
 ```
 
-**Total project code: ~1 850 lines (excluding venv)**
+**Total project code: ~2 500 lines (excluding venv)**
 
 ---
 
@@ -60,7 +60,10 @@ blast_sim/
 
 ### 2 · Building Geometry — `core/geometry.py`
 
-Parametric generator. Configurable parameters:
+Two building generators are available, both producing the same `Panel / Column / Room` objects with full SDOF properties:
+
+#### `create_building()` — Parametric grid generator
+Configurable parameters:
 
 - Width, depth, number of floors, floor height
 - Wall and floor thickness
@@ -69,7 +72,17 @@ Parametric generator. Configurable parameters:
 - Window fraction of exterior wall area
 - Wall and floor material
 
-Generates:
+#### `create_building_from_blueprint(blueprint)` — JSON-driven generator
+Accepts a blueprint dict (see **Blueprint Format** below) that specifies
+arbitrary room layouts per floor. Rooms are axis-aligned rectangles; any number
+of rooms can be placed per floor and rooms can vary between floors.
+
+Supports **variable floor heights** via the `floor_heights` list in the
+building config — each entry overrides the floor height for that storey
+independently. Floor `z_bot` values are accumulated correctly:
+`z_bot[f] = Σ floor_heights[0..f-1]`.
+
+Both generators produce:
 - **Exterior wall panels** (solid + window sub-panels)
 - **Interior partition walls** (room subdivisions)
 - **Floor slabs** and **roof**
@@ -86,6 +99,50 @@ Equivalent mass:    Me = KLM × ρ·A·t
 Yield displacement: wy = α·Py·a⁴ / (D · BC_factor)
 Failure displacement: wf = wy × ductility_ratio (μ)
 ```
+
+#### Blueprint Format — Native (blast-sim)
+```json
+{
+  "building": {
+    "n_floors": 2,
+    "floor_height": 3.0,
+    "floor_heights": [4.27, 3.05, 3.05],
+    "wall_thickness": 0.20,
+    "floor_thickness": 0.25,
+    "col_size": 0.40,
+    "wall_material": "concrete",
+    "window_frac": 0.30,
+    "total_occupants": 0
+  },
+  "floors": [
+    {
+      "rooms": [
+        {"x_min": 0, "x_max": 5,  "y_min": 0, "y_max": 4, "name": "Room A"},
+        {"x_min": 5, "x_max": 12, "y_min": 0, "y_max": 4, "name": "Room B"}
+      ]
+    }
+  ]
+}
+```
+
+`floor_heights` overrides `floor_height` per storey when provided.
+Room coordinates start at (0, 0) and must tile the footprint without gaps.
+
+#### Blueprint Format — OpenStudio FloorSpaceJS (auto-detected)
+The **FloorSpaceJS** format exported by OpenStudio's floor-plan editor is also
+accepted directly. It is detected automatically by the presence of a `stories`
+top-level key. The converter (`parse_floorspacejs` in `dashboard.py`):
+
+1. Iterates each `story` and reads its `geometry` (vertices, edges, faces)
+2. Reconstructs each `space` polygon by walking the face edge list
+3. Computes the axis-aligned bounding box of each polygon (rooms are
+   approximated as rectangles for the blast simulation)
+4. Converts coordinates from feet to metres (× 0.3048)
+5. Maps each story's `floor_to_ceiling_height` to a per-floor height entry
+
+Example FloorSpaceJS output: a 4-storey, 200 ft × 65 ft building with 18–20
+spaces per floor is converted to a blueprint with
+`floor_heights = [4.267, 3.048, 3.048, 3.048]` metres and 78 rooms total.
 
 ### 3 · Materials — `core/materials.py`
 
@@ -118,7 +175,13 @@ Me · ÿ + C · ẏ + K · y = KL · P(t) · A
   sub-grid at td/20 resolution over the positive-phase window before building
   the interpolant, ensuring near-field panels are not under-damaged relative to
   far-field panels.
-- Panels sheltered from the blast receive 10% of the direct load
+- **Sheltered-side factor**: `facing = dot(−r/R, n)`. If `facing < −0.1` the
+  panel's back face is towards the blast; it receives 10% of the direct load.
+  The factor is applied to `pressure_arr` once, before the fine/coarse path
+  branch, so both paths (short-td fine-grid and long-td coarse) use the same
+  attenuated array. (An earlier regression had applied the factor only on the
+  fine-grid path, causing far-side panels to appear *more* damaged than
+  near-side panels — this is now fixed.)
 - **Damage index** = peak displacement / yield displacement
   - DI ≥ 1 → yielded (structural damage)
   - DI ≥ μ → failed (element removed)
@@ -198,13 +261,14 @@ by a material-dependent transmission factor:
 ```
 ┌─ Sidebar (260 px) ─┬──── 3D View + Charts ────┬─ Right Panel (245 px) ─┐
 │  [▶ Run Simulation] │  Interactive 3D building  │  [Injuries][Rescue Plan]│
-│  ─────────────────  │  (colour-coded damage)    │  ──────────────────────│
-│  Building controls  ├──────────────────────────┤  Injuries tab:         │
-│  Blast controls     │  4-panel results chart    │   per-person injury    │
-│  People section     │                           │   assessment cards     │
-│  Place-mode toggle  │                           │  Rescue Plan tab:      │
-│  Floor plan         │                           │   priority-ordered     │
-│  Exits section      │                           │   rescue route cards   │
+│  ─────────────────  │  (click floor to place    │  ──────────────────────│
+│  Building controls  │   👤/🚪 in 3D)            │  Injuries tab:         │
+│  Blueprint JSON ↑   ├──────────────────────────┤   per-person injury    │
+│  Blast controls     │  4-panel results chart    │   assessment cards     │
+│  People section     │                           │  Rescue Plan tab:      │
+│  Place-mode toggle  │                           │   priority-ordered     │
+│  Floor plan (2D)    │                           │   rescue route cards   │
+│  Exits section      │                           │                        │
 │  (scrollable area)  │                           │                        │
 └─────────────────────┴──────────────────────────┴────────────────────────┘
 ```
@@ -215,17 +279,28 @@ All numeric parameters (building dimensions, blast position, TNT mass, etc.) use
 
 ### Controls
 - **Building**: width, depth, floors, floor height (all number inputs), wall material (dropdown), room grid X/Y, window fraction
+- **Blueprint JSON** (below building controls):
+  - **Drag-and-drop or file-select** — accepts any `.json` file in native
+    blast-sim format or OpenStudio FloorSpaceJS format. Format is
+    auto-detected. On upload the file is parsed, the `bld-floors` counter is
+    set to the blueprint's floor count, the floor-selector is updated, and
+    the **3D structural model is rendered immediately** (no need to run the
+    simulation first). Status line shows filename, floor count, and room count.
+  - **Clear Blueprint** — removes the loaded blueprint and reverts to the
+    parametric grid generator for the next simulation run.
 - **Blast source**: TNT equivalent, X/Y/Z position (all number inputs), burst type (dropdown: surface / free-air)
 - **People**:
-  - **Floor selector** — auto-updates to match the current number of floors
-  - **Click floor plan** (in Person mode) — drops a person at the clicked grid position (0.5 m resolution)
+  - **Floor selector** — auto-updates to match the current number of floors (reads `n_floors` from blueprint when loaded)
+  - **Click floor plan** (in Person mode) — drops a person at the clicked grid position on the 2D plan (0.5 m resolution). Blueprint rooms are drawn as blue-outlined shapes; parametric grid rooms are grey.
+  - **Click 3D model** (in Person mode) — drops a person at the clicked position. An invisible 1 m click grid at standing height (floor_bot + 1.2 m) on every floor level provides hover targets; clicking any point on it places a person at that (x, y, z).
   - **＋ Add** — places a person at (3.0, 3.0) on the selected floor
   - **Clear** — removes all people
   - **×** — removes one person from the list
   - Each person in the list shows name, and X / Y / Z in metres
-- **Place mode toggle** (above the floor plan): switches between `👤 Person` and `🚪 Exit` modes to control what a floor-plan click creates
+- **Place mode toggle** (above the floor plan): switches between `👤 Person` and `🚪 Exit` modes — controls what *both* floor-plan clicks and 3D model clicks create
 - **Exits & Entrances**:
-  - **Click floor plan** (in Exit mode) — drops an exit at the clicked position
+  - **Click floor plan** (in Exit mode) — drops an exit at the clicked position on the 2D plan
+  - **Click 3D model** (in Exit mode) — drops an exit at the clicked floor position; floor index is read from the `customdata` attached to each click-grid point
   - **＋ Add Exit** — places an exit at (0.0, 5.0) on the selected floor
   - **Clear** — removes all exits
   - **×** — removes one exit from the list
@@ -316,8 +391,13 @@ All numeric parameters (building dimensions, blast position, TNT mass, etc.) use
 20. **Panel Response tab removed** — The right-panel `dbc.Tabs` wrapper and Panel Response tab (pressure/displacement time history of the most-damaged panel) have been removed. Error tracebacks from the simulation callback are printed to the server console instead of the UI.
 21. **Metric tiles show actual person counts** — Fatal, Severe Inj., and Minor Inj. tiles show the count of individually placed people at that severity level, not statistical room-occupancy percentages.
 22. **3D view — per-type colour coding and filter dropdown** — Each panel type (exterior wall, interior wall, window, floor/roof) now uses a distinct colour family so damage to different structural elements is immediately distinguishable. Windows use low opacity (22%) when intact and higher opacity (55%) when failed. A legend is shown in the top-left of the 3D view. Hover text now includes material name, panel dimensions, thickness, and DI.
-24. **Interior-wall sheltered-side check** — each interior partition is assigned a single outward normal (+x or +y). The sheltered-side heuristic (10% load when the blast is behind the normal direction) is therefore orientation-dependent; the same interior wall receives full direct load from one room and 10% from the other. Interior loads are predominantly driven by the interior-pressure propagation model rather than direct SDOF integration, so the impact on final room pressures is small, but the SDOF damage index for individual interior panels can be asymmetric.
 23. **Exits & rescue routes** — `core/rescue.py` implements Dijkstra pathfinding through a room-adjacency graph. Edge costs: intact wall = 1.0, damaged (DI ≥ 0.5) = 2.0, failed wall = 5.0. Exits are placed by the user on the floor plan (in Exit mode). After simulation the Rescue Plan tab shows priority-ordered routes (1 Immediate → 5 Expectant) and dotted route lines are drawn on the floor plan. Room data (`x_min`, `x_max`, `y_min`, `y_max`, `floor_idx`, `z_bot`, `z_top`) is serialised into `sim-store` so routes can be re-computed whenever exits or people change without re-running the simulation. Panel `room_inside` / `room_outside` IDs are also stored so the graph builder can identify which rooms each interior wall connects.
+24. **Interior-wall sheltered-side check** — each interior partition is assigned a single outward normal (+x or +y). The sheltered-side heuristic (10% load when the blast is behind the normal direction) is therefore orientation-dependent; the same interior wall receives full direct load from one room and 10% from the other. Interior loads are predominantly driven by the interior-pressure propagation model rather than direct SDOF integration, so the impact on final room pressures is small, but the SDOF damage index for individual interior panels can be asymmetric.
+25. **Sheltered-side factor applied once before fine/coarse branch** — `facing_factor` (0.1 for back-facing panels, 1.0 otherwise) is multiplied into `pressure_arr` immediately after it is computed, before the `td < 10·dt` branch check. This ensures both the fine sub-grid path and the coarse interpolation path use the same attenuated pressure. A previous regression applied the factor only inside the fine-grid branch, so far-side panels with longer positive-phase durations (coarse path) incorrectly received full pressure and appeared more damaged than near-side panels.
+26. **Blueprint rooms approximated as axis-aligned bounding boxes** — `create_building_from_blueprint` and the FloorSpaceJS converter both represent rooms as rectangles (`x_min`, `x_max`, `y_min`, `y_max`). Non-rectangular or L-shaped spaces (common in FloorSpaceJS plans) are approximated by their bounding box. This over-estimates the room area and can create small geometry mismatches at re-entrant corners, but does not affect blast load calculations significantly since overpressure attenuates smoothly with distance.
+27. **FloorSpaceJS cell-to-room lookup uses first-match** — the interior grid-cell → room mapping iterates rooms in definition order and returns the first match. When two bounding boxes overlap (e.g. a wide corridor and a narrow room sharing an edge), the first room wins and the overlapping cell is assigned to it. This can produce extra or missing interior partition walls in overlap regions, but is acceptable for training-level fidelity.
+28. **3D click-to-place uses invisible Scatter3d grid** — clicking on panel meshes (Mesh3d traces) in Plotly 3D does not return reliable x/y/z coordinates. Instead, an invisible dense 1 m Scatter3d grid is added at standing height (floor_bot + 1.2 m) on each floor. Clicks on this grid are identified by the presence of `customdata` in the click event. Clicking directly on a wall surface (no customdata) is ignored. This means the floor area must be unobstructed for a click to register — if the user clicks on a panel face rather than the floor space, the placement is silently ignored and they should click again in open floor area.
+29. **Blueprint-driven 3D preview uses `allow_duplicate`** — `manage_blueprint` and `run_sim` both update `graph-3d`. Dash 4.x requires the non-primary callback to set `allow_duplicate=True` on that output. `run_sim` holds the primary output; `manage_blueprint` uses `allow_duplicate=True`. If both fire in the same update cycle (e.g. uploading a blueprint and immediately clicking Run), `run_sim`'s result overwrites the preview — the correct behaviour.
 
 ---
 
