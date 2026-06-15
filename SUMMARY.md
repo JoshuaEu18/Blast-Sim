@@ -1,6 +1,6 @@
 # Gas Leak Blast Damage Simulator — Project Summary
 
-*Last updated: 2026-06-05 (rev 11)*
+*Last updated: 2026-06-15 (rev 12)*
 
 A physics-based training simulator for engineers and emergency responders to
 evaluate structural damage and human casualties from indoor gas-leak explosions.
@@ -51,12 +51,32 @@ blast_sim/
 | Item | Detail |
 |---|---|
 | Model | Kinney & Graham (1985) empirical scaling laws |
-| Inputs | TNT equivalent mass (kg), standoff distance (m) |
+| Inputs | Charge mass (kg), explosive type, standoff distance (m) |
 | Outputs | Peak side-on overpressure `Pso` (kPa), positive-phase duration `td` (ms), specific impulse `Is` (kPa·ms) |
 | Waveform | Modified Friedlander exponential; waveform parameter `b` solved numerically from impulse constraint |
 | Reflected pressure | Rankine-Hugoniot normal reflection, with cosine-law angle-of-incidence correction |
 | Burst types | **Surface** (gas-leak ground burst — TNT doubled for hemispherical confinement), **free-air** |
 | Arrival time | Ambient speed of sound (340 m/s) |
+
+#### TNT Equivalency — `TNT_EQUIVALENCY` (UFC 3-340-02)
+
+The charge mass is converted to an effective TNT mass before applying Kinney-Graham scaling:
+
+| Explosive | Overpressure factor | Impulse factor |
+|---|---|---|
+| TNT | 1.00 | 1.00 |
+| C4 (Composition C-4) | 1.34 | 1.19 |
+| ANFO | 0.82 | 0.82 |
+| PETN | 1.27 | 1.00 |
+| Semtex 1A | 1.25 | 1.00 |
+| RDX | 1.14 | 1.09 |
+| HMX | 1.14 | 1.02 |
+| Ammonium Nitrate (pure) | 0.42 | 0.45 |
+
+The overpressure factor is used for structural response (`tnt_equivalent()` → `W_eff`).
+The impulse factor is available in the dict but currently informational only (Kinney-Graham
+impulse is derived consistently from `W_eff`). The sidebar displays `W_TNT` live as the user
+changes explosive type or charge mass.
 
 ### 2 · Building Geometry — `core/geometry.py`
 
@@ -149,10 +169,16 @@ spaces per floor is converted to a blueprint with
 | Material | E (GPa) | ρ (kg/m³) | fy (MPa) | μ |
 |---|---|---|---|---|
 | Reinforced Concrete | 30 | 2 400 | 25 | 4.0 |
-| Brick Masonry | 6 | 1 800 | 6 | 1.5 |
+| Brick Masonry | 6 | 1 800 | **0.7** | 1.5 |
 | Steel Plate | 200 | 7 850 | 250 | 12.0 |
 | Annealed Glass | 70 | 2 500 | 30 | 1.0 |
 | Structural Steel | 200 | 7 850 | 345 | 15.0 |
+
+**Brick masonry `fy` corrected (rev 12):** The previous value of 6 MPa was 6–15× too high relative to the
+BS EN 1996-1-1 design value of 0.4–1.0 MPa for unreinforced masonry in flexure. The updated value of
+0.7 MPa (mid-range of the code band) gives a yield displacement ≈ 8× smaller and a failure displacement
+≈ 12× smaller than before — brick walls now fail at much lower blast pressures, consistent with observed
+masonry fragility in blast events.
 
 ### 4 · Structural Simulation — `core/simulation.py`
 
@@ -240,6 +266,9 @@ by a material-dependent transmission factor:
 | Annealed Glass (intact) | 70% |
 | Any failed panel | 88% (open gap) |
 
+**Frontal area (rev 12):** `_FRONTAL_AREA = 0.6 m²` — representative standing-adult frontal area per UFC 3-340-02 / the implicit
+assumptions register. The previous value of 0.7 m² over-estimated throw velocity by ~17%.
+
 **Injury types computed:**
 
 | Injury | Model |
@@ -248,7 +277,7 @@ by a material-dependent transmission factor:
 | Pulmonary barotrauma | Baker (1983) Probit: `Y = −77.1 + 6.91·ln(Pso_Pa)` |
 | Abdominal / GI injury | Linear threshold (150–350 kPa) |
 | Blast traumatic brain injury | Linear threshold (80–430 kPa) |
-| Whole-body displacement | Impulse ÷ specific body mass → throw velocity → impact severity |
+| Whole-body displacement | Impulse × 0.6 m² ÷ body mass → throw velocity → impact severity |
 | Fragment / debris | Distance to nearest failed panel |
 
 **Overall severity:** Uninjured / Minor / Moderate / Severe / Fatal
@@ -288,7 +317,10 @@ All numeric parameters (building dimensions, blast position, TNT mass, etc.) use
     simulation first). Status line shows filename, floor count, and room count.
   - **Clear Blueprint** — removes the loaded blueprint and reverts to the
     parametric grid generator for the next simulation run.
-- **Blast source**: TNT equivalent, X/Y/Z position (all number inputs), burst type (dropdown: surface / free-air)
+- **Blast source**: Explosive type (dropdown — TNT, C4, ANFO, PETN, Semtex 1A, RDX, HMX, Ammonium Nitrate),
+  charge mass (kg), X/Y/Z position (all number inputs), burst type (dropdown: surface / free-air).
+  A live label below the explosive dropdown shows the effective TNT equivalent mass (`W_TNT = mass × factor`)
+  and the overpressure factor so the user understands the conversion at a glance.
 - **People**:
   - **Floor selector** — auto-updates to match the current number of floors (reads `n_floors` from blueprint when loaded)
   - **Click floor plan** (in Person mode) — drops a person at the clicked grid position on the 2D plan (0.5 m resolution). Blueprint rooms are drawn as blue-outlined shapes; parametric grid rooms are grey.
@@ -361,7 +393,8 @@ All numeric parameters (building dimensions, blast position, TNT mass, etc.) use
 |---|---|
 | Kinney & Graham (1985) *Explosive Shocks in Air* | Blast scaling laws (overpressure, duration, impulse) |
 | Baker et al. (1983) *Explosion Hazards and Evaluation* | Lung-haemorrhage and eardrum Probit functions |
-| UFC 3-340-02 (2008) *Structures to Resist the Effects of Accidental Explosions* | SDOF transformation factors (KL, KM, KLM), limit states |
+| UFC 3-340-02 (2008) *Structures to Resist the Effects of Accidental Explosions* | SDOF transformation factors (KL, KM, KLM), limit states, TNT equivalency factors, person frontal area (0.6 m²) |
+| BS EN 1996-1-1 *Design of Masonry Structures* | Brick masonry flexural tensile strength (0.4–1.0 MPa) |
 | Timoshenko & Woinowsky-Krieger (1959) *Theory of Plates and Shells* | Plate deflection and moment coefficients (α, β tables) |
 | Möller & Trumbore (1997) | Ray-triangle intersection algorithm for shielding |
 

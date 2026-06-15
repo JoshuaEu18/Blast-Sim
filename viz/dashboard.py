@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.materials  import MATERIALS
 from core.geometry   import create_building, create_building_from_blueprint
-from core.blast      import BlastSource
+from core.blast      import BlastSource, TNT_EQUIVALENCY
 from core.simulation import run_simulation
 from core.persons    import Person, assess_person_injuries
 from core.rescue     import Exit, RescueRoute, compute_rescue_routes, RESCUE_PRIORITY, PRIORITY_LABEL
@@ -931,7 +931,16 @@ def create_app():
                            'fontSize': '10px', 'cursor': 'pointer', 'marginBottom': '6px'}),
 
         html.Div('Blast Source', className='section-label accent-red'),
-        _numbox('blast-tnt', 'TNT equivalent (kg)', 1, 500, 1, 25),
+        html.Div('Explosive type',
+                 style={'color':_MUTED,'fontSize':'11px','marginBottom':'3px'}),
+        _dropdown('blast-explosive',
+                  [{'label': f'{v[0]}  (×{v[1]:.2f} TNT)', 'value': k}
+                   for k, v in TNT_EQUIVALENCY.items()],
+                  'tnt'),
+        html.Div(id='explosive-label',
+                 style={'fontSize':'9px','color':_MUTED,'marginBottom':'4px',
+                        'minHeight':'12px'}),
+        _numbox('blast-mass', 'Charge mass (kg)', 1, 500, 1, 25),
         dbc.Row([
             dbc.Col(_numbox('blast-x', 'X (m)', -10, 30, 0.5,  6.0), width=6),
             dbc.Col(_numbox('blast-y', 'Y (m)', -10, 20, 0.5, -3.0), width=6),
@@ -1486,6 +1495,20 @@ def create_app():
 
         return children, routes_serial
 
+    # ── Explosive-label live update ──────────────────────────────────────────
+
+    @app.callback(
+        Output('explosive-label', 'children'),
+        Input('blast-explosive',  'value'),
+        Input('blast-mass',       'value'),
+    )
+    def update_explosive_label(exp_key, mass):
+        exp_key = exp_key or 'tnt'
+        mass    = float(mass or 25)
+        name, op_f, imp_f = TNT_EQUIVALENCY.get(exp_key, ('TNT', 1.0, 1.0))
+        w_tnt = mass * op_f
+        return f'→ W_TNT = {w_tnt:.1f} kg  (×{op_f:.2f} overpressure)'
+
     # ── Main simulation run ──────────────────────────────────────────────────
 
     @app.callback(
@@ -1501,7 +1524,8 @@ def create_app():
         State('bld-floors', 'value'), State('bld-fh',     'value'),
         State('bld-mat',    'value'), State('bld-rx',     'value'),
         State('bld-ry',     'value'), State('bld-wf',     'value'),
-        State('blast-tnt',  'value'),
+        State('blast-mass',      'value'),
+        State('blast-explosive', 'value'),
         State('blast-x',    'value'), State('blast-y',    'value'),
         State('blast-z',    'value'), State('blast-type', 'value'),
         State('people-store',    'data'),
@@ -1510,7 +1534,7 @@ def create_app():
     )
     def run_sim(n_clicks,
                 width, depth, n_floors, fh, mat_key, n_rx, n_ry, wfrac,
-                tnt, bx, by, bz, btype, people_data, blueprint):
+                mass, explosive_key, bx, by, bz, btype, people_data, blueprint):
         try:
             if blueprint:
                 # Re-parse in case the store holds raw FloorSpaceJS
@@ -1533,9 +1557,11 @@ def create_app():
                     window_frac=float(wfrac or 0.3),
                     total_occupants=0,
                 )
+            exp_key = explosive_key or 'tnt'
             blast = BlastSource(
                 x=float(bx or 6), y=float(by or -3), z=float(bz or 0.5),
-                tnt_kg=float(tnt or 25), burst_type=btype or 'surface',
+                tnt_kg=float(mass or 25), burst_type=btype or 'surface',
+                explosive_type=exp_key,
             )
             result = run_simulation(
                 blast=blast, panels=panels, columns=columns, rooms=rooms,
@@ -1621,8 +1647,10 @@ def create_app():
                 dbc.Col(_tile(f"{stability:.0f}%", 'Stability', stab_color), width=3),
             ], className='g-2').children
 
+            exp_name = TNT_EQUIVALENCY.get(exp_key, ('TNT',))[0]
             status_txt = f'✓  {len(panels)} panels · {len(rooms)} rooms · done'
-            header_txt = (f'{int(tnt or 25)} kg TNT  ·  '
+            header_txt = (f'{float(mass or 25):.0f} kg {exp_name}  ·  '
+                          f'W_TNT={blast.W_eff / (2.0 if (btype or "surface") == "surface" else 1.0):.1f} kg  ·  '
                           f'({float(bx):.1f}, {float(by):.1f}, {float(bz):.1f}) m')
 
             return (fig_3d, fig_results,

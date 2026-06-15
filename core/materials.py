@@ -25,7 +25,7 @@ CONCRETE = Material(
 BRICK = Material(
     name='Brick Masonry',
     E=6e9, nu=0.2, rho=1800,
-    fy=6e6, fu=8e6,
+    fy=0.7e6, fu=1.0e6,   # BS EN 1996-1-1: flexural tensile strength 0.4–1.0 MPa
     ductility=1.5, damping_ratio=0.07,
     color='#C46B40',
 )

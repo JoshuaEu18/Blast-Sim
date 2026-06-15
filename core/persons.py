@@ -18,7 +18,7 @@ from scipy.special import ndtr
 from .blast import (BlastSource, scaled_distance,
                     peak_overpressure, positive_duration, specific_impulse)
 
-_FRONTAL_AREA = 0.7   # m²  representative frontal area of standing person
+_FRONTAL_AREA = 0.6   # m²  representative frontal area of standing person (UFC 3-340-02 / implicit assumption register)
 
 
 # ---------------------------------------------------------------------------

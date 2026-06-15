@@ -12,6 +12,30 @@ from scipy.optimize import brentq
 P_ATM = 101.325   # kPa  atmospheric pressure
 C_SOUND = 340.0   # m/s  ambient speed of sound
 
+# ---------------------------------------------------------------------------
+# TNT equivalency factors (UFC 3-340-02 / published literature)
+# Overpressure factors used for structural response; impulse factors used
+# for casualty calculations (eardrum, throw velocity).
+# ---------------------------------------------------------------------------
+
+TNT_EQUIVALENCY: dict = {
+    # (display name, overpressure_factor, impulse_factor)
+    'tnt':               ('TNT',                    1.00, 1.00),
+    'c4':                ('C4 (Composition C-4)',    1.34, 1.19),
+    'anfo':              ('ANFO',                   0.82, 0.82),
+    'petn':              ('PETN',                   1.27, 1.00),
+    'semtex':            ('Semtex 1A',              1.25, 1.00),
+    'rdx':               ('RDX',                    1.14, 1.09),
+    'hmx':               ('HMX',                    1.14, 1.02),
+    'ammonium_nitrate':  ('Ammonium Nitrate (pure)', 0.42, 0.45),
+}
+
+
+def tnt_equivalent(mass_kg: float, explosive_key: str) -> float:
+    """Return TNT equivalent mass [kg] for structural response calculations."""
+    _, op_factor, _ = TNT_EQUIVALENCY.get(explosive_key, ('', 1.0, 1.0))
+    return mass_kg * op_factor
+
 
 # ---------------------------------------------------------------------------
 # Scaled-distance relations (Kinney & Graham 1985)
@@ -91,11 +115,15 @@ class BlastSource:
     """
 
     def __init__(self, x: float, y: float, z: float,
-                 tnt_kg: float, burst_type: str = 'surface'):
+                 tnt_kg: float, burst_type: str = 'surface',
+                 explosive_type: str = 'tnt'):
         self.pos = np.array([x, y, z], dtype=float)
         self.W_input = tnt_kg
+        self.explosive_type = explosive_type
+        # Apply TNT equivalency factor for structural response
+        w_tnt = tnt_equivalent(tnt_kg, explosive_type)
         # Surface burst: energy confined to hemisphere → equivalent to 2× free-air
-        self.W_eff = tnt_kg * 2.0 if burst_type == 'surface' else tnt_kg
+        self.W_eff = w_tnt * 2.0 if burst_type == 'surface' else w_tnt
         self.burst_type = burst_type
 
     def panel_loading(self,
