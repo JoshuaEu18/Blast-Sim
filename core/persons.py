@@ -68,15 +68,23 @@ class PersonInjury:
 # Shielding  (ray–panel intersection)
 # ---------------------------------------------------------------------------
 
-# Fraction of overpressure transmitted through one wall of each material type
+# Fraction of overpressure transmitted through one *intact* wall of each
+# material type. An intact heavy wall passes only leakage pressure through
+# cracks and joints — these values are calibrated to be consistent with the
+# room-propagation model in simulation.py (5 % leakage through an intact
+# exterior wall) and scale inversely with panel areal mass / stiffness.
 _TRANSMISSION = {
-    'Reinforced Concrete': 0.12,
-    'Brick Masonry':       0.22,
-    'Steel Plate':         0.10,
-    'Annealed Glass':      0.70,
-    'Structural Steel':    0.10,
+    'Reinforced Concrete': 0.05,   # ~480 kg/m² @ 200 mm — matches 5 % leakage factor
+    'Brick Masonry':       0.08,   # lighter, more joints/cracking than RC
+    'Steel Plate':         0.03,   # airtight, very high acoustic impedance
+    'Structural Steel':    0.03,
+    'Annealed Glass':      0.35,   # 6 mm glazing (~15 kg/m²) flexes and re-radiates
 }
-_FAILED_TRANSMISSION = 0.88   # failed panel ≈ open gap
+_DEFAULT_TRANSMISSION = 0.10      # unknown material
+# A failed panel is a breach opening: the wave diffracts and expands through
+# the gap rather than passing unimpeded. Matches the 50 % breach factor used
+# by the interior-propagation model in simulation.py.
+_FAILED_TRANSMISSION = 0.50
 
 
 def _ray_triangle(origin: np.ndarray, direction: np.ndarray,
@@ -124,27 +132,36 @@ def compute_shielding(person_pos: np.ndarray, blast_pos: np.ndarray,
         return 1.0, 0
 
     ray_dir = ray / ray_len
-    attenuation = 1.0
-    n_walls = 0
 
+    # Wall panels and their window sub-panels are co-located (same quad in
+    # the geometry model), so a single ray hits both. Physically the wave
+    # passes through EITHER the solid wall OR the glazing, not both in
+    # series — group hits by location and take the most transmissive path
+    # through each physical wall.
+    barrier_trans: dict = {}   # rounded-center key -> best (max) transmission
     for panel in panels:
-        if panel.panel_type in ('floor', 'roof'):
-            continue   # ignore horizontal surfaces for horizontal blast path
-
+        # Floor and roof slabs are included so vertical blast paths
+        # (blast on one floor, person on another) are shielded correctly.
         if not _ray_hits_panel(blast_pos, ray_dir, ray_len, panel):
             continue
 
-        n_walls += 1
         pr = panel_results.get(panel.id)
         failed = (pr.failed if pr is not None else getattr(panel, 'failed', False))
 
         if failed:
-            attenuation *= _FAILED_TRANSMISSION
+            trans = _FAILED_TRANSMISSION
         else:
             mat_name = getattr(panel.material, 'name', '')
-            attenuation *= _TRANSMISSION.get(mat_name, 0.20)
+            trans = _TRANSMISSION.get(mat_name, _DEFAULT_TRANSMISSION)
 
-    return float(attenuation), n_walls
+        key = tuple(np.round(np.asarray(panel.center), 3))
+        barrier_trans[key] = max(barrier_trans.get(key, 0.0), trans)
+
+    attenuation = 1.0
+    for trans in barrier_trans.values():
+        attenuation *= trans
+
+    return float(attenuation), len(barrier_trans)
 
 
 # ---------------------------------------------------------------------------

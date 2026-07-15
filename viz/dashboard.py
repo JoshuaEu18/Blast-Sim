@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.materials  import MATERIALS
 from core.geometry   import create_building, create_building_from_blueprint
-from core.blast      import BlastSource, TNT_EQUIVALENCY
+from core.blast      import BlastSource, TNT_EQUIVALENCY, SURFACE_BURST_FACTOR
 from core.simulation import run_simulation
 from core.persons    import Person, assess_person_injuries
 from core.rescue     import Exit, RescueRoute, compute_rescue_routes, RESCUE_PRIORITY, PRIORITY_LABEL
@@ -98,10 +98,18 @@ def parse_floorspacejs(data: dict) -> dict:
 
 def _auto_parse_blueprint(raw: dict) -> dict:
     """Detect format and return a blast-sim blueprint dict."""
-    if 'stories' in raw:
-        return parse_floorspacejs(raw)
-    # Already in blast-sim format (has 'building' + 'floors')
-    return raw
+    bp = parse_floorspacejs(raw) if 'stories' in raw else raw
+    if not WINDOWS_ENABLED:
+        bp.setdefault('building', {})['window_frac'] = 0.0
+    return bp
+
+
+# ── Feature flags ──────────────────────────────────────────────────────────
+
+# Windows temporarily disabled (rev 14): glass sub-panels are excluded from
+# the generated geometry until the glazing damage model is recalibrated.
+# Set to True to restore the window-fraction control and glass panels.
+WINDOWS_ENABLED = False
 
 
 # ── Shared theme ───────────────────────────────────────────────────────────
@@ -179,12 +187,12 @@ _PANEL_TYPE_LABEL = {
 }
 
 _LEGEND_ENTRIES = [
-    ('Ext. Wall — intact',    'rgb(0,185,40)'),
-    ('Int. Wall — intact',    'rgb(40,160,140)'),
-    ('Window — intact',       'rgb(60,160,230)'),
-    ('Floor / Roof — intact', 'rgb(70,110,160)'),
-    ('Any — yielded (DI ≥ 1)', _ORANGE),
-    ('Any — failed',          'rgb(200,25,25)'),
+    ('Ext. Wall — intact',    'rgb(0,185,40)',    None),
+    ('Int. Wall — intact',    'rgb(40,160,140)',  None),
+    ('Window — intact',       'rgb(60,160,230)',  'window'),
+    ('Floor / Roof — intact', 'rgb(70,110,160)',  None),
+    ('Any — yielded (DI ≥ 1)', _ORANGE,           None),
+    ('Any — failed',          'rgb(200,25,25)',   None),
 ]
 
 
@@ -229,8 +237,11 @@ def build_3d_figure(panels, columns, result=None, people_injuries=None, blast_po
         ))
         trace_groups.append(ptype)
 
-    # ── Legend dummy traces ───────────────────────────────────────────────────
-    for leg_name, leg_col in _LEGEND_ENTRIES:
+    # ── Legend dummy traces (window entry only when windows exist) ────────────
+    has_windows = any(p.panel_type == 'window' for p in panels)
+    for leg_name, leg_col, leg_req in _LEGEND_ENTRIES:
+        if leg_req == 'window' and not has_windows:
+            continue
         traces.append(go.Scatter3d(
             x=[None], y=[None], z=[None],
             mode='markers',
@@ -329,18 +340,22 @@ def build_3d_figure(panels, columns, result=None, people_injuries=None, blast_po
         return [True if (g in _ALWAYS or g in show_panel_types) else False
                 for g in trace_groups]
 
-    _FILTER_BUTTONS = [
-        ('Exterior walls',  {'ext_wall'}),
-        ('Interior walls',  {'int_wall'}),
-        ('Windows',         {'window'}),
-        ('Floors & roof',   {'floor', 'roof'}),
-        ('Walls & windows', {'ext_wall', 'int_wall', 'window'}),
+    filter_buttons = [
+        ('All elements',   {'ext_wall', 'int_wall', 'window', 'floor', 'roof'}),
+        ('Exterior walls', {'ext_wall'}),
+        ('Interior walls', {'int_wall'}),
     ]
+    if has_windows:
+        filter_buttons += [('Windows', {'window'}),
+                           ('Walls & windows', {'ext_wall', 'int_wall', 'window'})]
+    else:
+        filter_buttons += [('All walls', {'ext_wall', 'int_wall'})]
+    filter_buttons.append(('Floors & roof', {'floor', 'roof'}))
 
     dropdown_buttons = [
         dict(label=lbl, method='restyle',
              args=[{'visible': _vis(groups)}])
-        for lbl, groups in _FILTER_BUTTONS
+        for lbl, groups in filter_buttons
     ]
 
     fig = go.Figure(data=traces)
@@ -629,6 +644,8 @@ def build_results_figure(rooms, result):
 def _empty_fig(msg=''):
     fig = go.Figure()
     fig.update_layout(**_layout(margin=dict(l=8,r=8,t=8,b=8)),
+                      xaxis=dict(visible=False),
+                      yaxis=dict(visible=False),
                       annotations=[dict(text=msg, x=0.5, y=0.5, xref='paper',
                                         yref='paper', showarrow=False,
                                         font=dict(color=_MUTED, size=12))])
@@ -838,25 +855,41 @@ def _dropdown(id_, options, val):
                                'fontSize':'12px'})
 
 
+_TILE_VARIANT = {'Fatal': 'fatal', 'Severe Inj.': 'severe',
+                 'Minor Inj.': 'minor', 'Stability': 'struct'}
+
+
 def _tile(value, label, col):
+    variant = _TILE_VARIANT.get(label, '')
     return html.Div([
         html.Div(value, className='metric-val', style={'color': col}),
         html.Div(label, className='metric-lbl'),
-    ], className='metric-tile')
+    ], className=f'metric-tile {variant}'.strip())
+
+
+def _empty_state(icon, text):
+    return html.Div([
+        html.Div(icon, className='empty-icon'),
+        html.Div(text, className='empty-text'),
+    ], className='empty-state')
 
 
 # ── App factory ────────────────────────────────────────────────────────────
 
 def create_app():
+    # Dash resolves the assets folder relative to this module (viz/) by
+    # default; the project stylesheet lives at the repo root, so point at it
+    # explicitly — otherwise assets/style.css is silently never served.
+    assets_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'assets')
     app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG],
                     title='Blast Damage Simulator',
+                    assets_folder=assets_dir,
                     suppress_callback_exceptions=True)
 
-    # ── Place-mode toggle ────────────────────────────────────────────────────
+    # ── Place-mode toggle (segmented control) ────────────────────────────────
     place_mode_row = html.Div([
-        html.Span('Click places:',
-                  style={'color': _MUTED, 'fontSize': '10px', 'marginRight': '8px',
-                         'lineHeight': '22px'}),
+        html.Div('CLICK TO PLACE', className='seg-caption'),
         dcc.RadioItems(
             id='place-mode',
             options=[
@@ -865,13 +898,9 @@ def create_app():
             ],
             value='person',
             inline=True,
-            inputStyle={'marginRight': '3px', 'cursor': 'pointer'},
-            labelStyle={'color': _TEXT, 'fontSize': '11px',
-                        'marginRight': '12px', 'cursor': 'pointer'},
+            className='seg-control',
         ),
-    ], style={'display': 'flex', 'alignItems': 'center', 'marginBottom': '6px',
-              'padding': '4px 6px', 'background': '#21262d',
-              'borderRadius': '6px', 'border': f'1px solid {_GRID}'})
+    ], style={'marginBottom': '6px'})
 
     sidebar = html.Div([
       html.Div([
@@ -881,7 +910,7 @@ def create_app():
       ], style={'padding':'10px 12px','borderBottom':'1px solid #21262d',
                 'background':'#161b22'}),
       html.Div([
-        html.Div('Building', className='section-label accent-blue'),
+        html.Div('🏢  Building', className='section-label accent-blue'),
         dbc.Row([
             dbc.Col(_numbox('bld-width',  'Width (m)',    5,  30, 1,   12), width=6),
             dbc.Col(_numbox('bld-depth',  'Depth (m)',    5,  20, 1,   10), width=6),
@@ -902,10 +931,9 @@ def create_app():
             dbc.Col(_numbox('bld-rx',  'Rooms X',       1, 4, 1, 2), width=6),
             dbc.Col(_numbox('bld-ry',  'Rooms Y',       1, 4, 1, 2), width=6),
         ], className='g-1'),
-        _numbox('bld-wf', 'Window frac.', 0, 0.7, 0.05, 0.30),
 
         # ── Blueprint upload ───────────────────────────────────────────────────
-        html.Div('Blueprint JSON', className='section-label accent-blue'),
+        html.Div('📐  Blueprint JSON', className='section-label accent-blue'),
         dcc.Upload(
             id='blueprint-upload',
             children=html.Div([
@@ -926,11 +954,9 @@ def create_app():
                  style={'fontSize': '10px', 'color': _MUTED, 'marginBottom': '4px',
                         'minHeight': '14px'}),
         html.Button('Clear Blueprint', id='btn-clear-blueprint', n_clicks=0,
-                    style={'background': 'none', 'border': f'1px solid {_GRID}',
-                           'color': _MUTED, 'borderRadius': '5px', 'padding': '3px 8px',
-                           'fontSize': '10px', 'cursor': 'pointer', 'marginBottom': '6px'}),
+                    className='btn-ghost', style={'marginBottom': '6px'}),
 
-        html.Div('Blast Source', className='section-label accent-red'),
+        html.Div('💥  Blast Source', className='section-label accent-red'),
         html.Div('Explosive type',
                  style={'color':_MUTED,'fontSize':'11px','marginBottom':'3px'}),
         _dropdown('blast-explosive',
@@ -958,7 +984,7 @@ def create_app():
         ], className='g-1'),
 
         # ── People ────────────────────────────────────────────────────────────
-        html.Div('People', className='section-label'),
+        html.Div('👥  People', className='section-label accent-orange'),
         dbc.Row([
             dbc.Col([
                 html.Div('Floor', style={'fontSize':'10px','color':_MUTED,'marginBottom':'2px'}),
@@ -970,13 +996,10 @@ def create_app():
             ], width=5),
             dbc.Col(html.Div([
                 html.Button('＋ Add', id='btn-add-person', n_clicks=0,
-                            style={'background':'#21262d','border':'1px solid #30363d',
-                                   'color':_TEXT,'borderRadius':'5px','padding':'4px 8px',
-                                   'fontSize':'11px','cursor':'pointer','marginRight':'4px'}),
+                            className='btn-ghost btn-solid',
+                            style={'marginRight': '4px'}),
                 html.Button('Clear', id='btn-clear-people', n_clicks=0,
-                            style={'background':'none','border':'1px solid #f8514940',
-                                   'color':_RED,'borderRadius':'5px','padding':'4px 8px',
-                                   'fontSize':'11px','cursor':'pointer'}),
+                            className='btn-ghost btn-danger'),
             ], style={'paddingTop':'16px'}), width=7),
         ], className='g-1', style={'marginBottom':'6px'}),
 
@@ -990,19 +1013,14 @@ def create_app():
         html.Div(id='people-list-sidebar', style={'marginTop':'6px'}),
 
         # ── Exits & Entrances ─────────────────────────────────────────────────
-        html.Div('Exits & Entrances', className='section-label'),
+        html.Div('🚪  Exits & Entrances', className='section-label accent-teal'),
         dbc.Row([
             dbc.Col(html.Button('＋ Add Exit', id='btn-add-exit', n_clicks=0,
-                                style={'background':'#21262d',
-                                       'border':f'1px solid {_TEAL}60',
-                                       'color':_TEAL,'borderRadius':'5px',
-                                       'padding':'4px 8px','fontSize':'11px',
-                                       'cursor':'pointer','width':'100%'}), width=6),
+                                className='btn-ghost btn-teal',
+                                style={'width': '100%'}), width=6),
             dbc.Col(html.Button('Clear', id='btn-clear-exits', n_clicks=0,
-                                style={'background':'none','border':'1px solid #f8514940',
-                                       'color':_RED,'borderRadius':'5px','padding':'4px 8px',
-                                       'fontSize':'11px','cursor':'pointer','width':'100%'}),
-                    width=6),
+                                className='btn-ghost btn-danger',
+                                style={'width': '100%'}), width=6),
         ], className='g-1', style={'marginBottom':'6px'}),
         html.Div(id='exits-list-sidebar', style={'marginTop':'2px'}),
 
@@ -1026,10 +1044,9 @@ def create_app():
                 tab_id='tab-injuries',
                 children=html.Div(
                     id='people-injuries-panel',
-                    children=html.Div(
-                        'Run simulation to see injury assessment.',
-                        style={'fontSize':'11px','color':_MUTED,'padding':'10px'},
-                    ),
+                    children=_empty_state('🩺', 'Place people on the floor plan, '
+                                                'then run the simulation to see '
+                                                'per-person injury assessments.'),
                     style={'overflowY':'auto','maxHeight':'calc(90vh - 95px)','padding':'8px'},
                 ),
             ),
@@ -1038,10 +1055,9 @@ def create_app():
                 tab_id='tab-rescue',
                 children=html.Div(
                     id='rescue-plan-panel',
-                    children=html.Div(
-                        'Place exits and run simulation to generate rescue routes.',
-                        style={'fontSize':'11px','color':_MUTED,'padding':'10px'},
-                    ),
+                    children=_empty_state('🚪', 'Place exits and people, then run '
+                                                'the simulation to generate '
+                                                'priority-ordered rescue routes.'),
                     style={'overflowY':'auto','maxHeight':'calc(90vh - 95px)','padding':'8px'},
                 ),
             ),
@@ -1052,7 +1068,7 @@ def create_app():
     app.layout = html.Div([
         html.Div([
             html.Span('💥', style={'fontSize':'18px'}),
-            html.H4('Gas Leak Blast Damage Simulator'),
+            html.H4('Blast Damage Simulator'),
             html.Span('SDOF + Shear-Building FEM  ·  Kinney-Graham blast model  ·  Baker (1983) injury model',
                       style={'color':_MUTED,'fontSize':'11px','marginLeft':'8px'}),
             html.Div(id='header-status', style={'marginLeft':'auto','fontSize':'11px','color':_MUTED}),
@@ -1074,6 +1090,9 @@ def create_app():
                         ], style={'display':'flex','alignItems':'center',
                                   'padding':'4px 10px 2px'}),
                         dcc.Graph(id='graph-3d',
+                                  figure=_empty_fig('Configure the building and blast source, '
+                                                    'then press ▶ Run Simulation — or upload a '
+                                                    'blueprint for an instant 3D preview.'),
                                   style={'flex':'1','minHeight':'0'},
                                   config={'displayModeBar':True,
                                           'modeBarButtonsToRemove':['toImage']}),
@@ -1385,15 +1404,13 @@ def create_app():
     def update_injury_panel(sim_store, people):
         people = people or []
         if not people:
-            return html.Div('Place people on the floor plan, then run the simulation.',
-                            style={'fontSize':'11px','color':_MUTED,'padding':'10px'})
+            return _empty_state('👤', 'Place people on the floor plan, '
+                                      'then run the simulation.')
         if not sim_store or 'panel_states' not in sim_store:
-            return html.Div('Run the simulation to see injury assessments.',
-                            style={'fontSize':'11px','color':_MUTED,'padding':'10px'})
+            return _empty_state('▶', 'Run the simulation to see injury assessments.')
         injuries = _get_people_injuries(people, sim_store)
         if not injuries:
-            return html.Div('No injuries to display.',
-                            style={'fontSize':'11px','color':_MUTED})
+            return _empty_state('✓', 'No injuries to display.')
         return [render_injury_card(inj) for inj in injuries]
 
     # ── Rescue plan panel ────────────────────────────────────────────────────
@@ -1523,7 +1540,7 @@ def create_app():
         State('bld-width',  'value'), State('bld-depth',  'value'),
         State('bld-floors', 'value'), State('bld-fh',     'value'),
         State('bld-mat',    'value'), State('bld-rx',     'value'),
-        State('bld-ry',     'value'), State('bld-wf',     'value'),
+        State('bld-ry',     'value'),
         State('blast-mass',      'value'),
         State('blast-explosive', 'value'),
         State('blast-x',    'value'), State('blast-y',    'value'),
@@ -1533,7 +1550,7 @@ def create_app():
         prevent_initial_call=True,
     )
     def run_sim(n_clicks,
-                width, depth, n_floors, fh, mat_key, n_rx, n_ry, wfrac,
+                width, depth, n_floors, fh, mat_key, n_rx, n_ry,
                 mass, explosive_key, bx, by, bz, btype, people_data, blueprint):
         try:
             if blueprint:
@@ -1554,7 +1571,7 @@ def create_app():
                     n_floors=int(n_floors or 3), floor_height=float(fh or 3),
                     wall_mat=wall_mat,
                     n_rooms_x=int(n_rx or 2), n_rooms_y=int(n_ry or 2),
-                    window_frac=float(wfrac or 0.3),
+                    window_frac=0.30 if WINDOWS_ENABLED else 0.0,
                     total_occupants=0,
                 )
             exp_key = explosive_key or 'tnt'
@@ -1650,7 +1667,7 @@ def create_app():
             exp_name = TNT_EQUIVALENCY.get(exp_key, ('TNT',))[0]
             status_txt = f'✓  {len(panels)} panels · {len(rooms)} rooms · done'
             header_txt = (f'{float(mass or 25):.0f} kg {exp_name}  ·  '
-                          f'W_TNT={blast.W_eff / (2.0 if (btype or "surface") == "surface" else 1.0):.1f} kg  ·  '
+                          f'W_TNT={blast.W_eff / (SURFACE_BURST_FACTOR if (btype or "surface") == "surface" else 1.0):.1f} kg  ·  '
                           f'({float(bx):.1f}, {float(by):.1f}, {float(bz):.1f}) m')
 
             return (fig_3d, fig_results,
@@ -1694,7 +1711,7 @@ def _get_people_injuries(people_data, sim_store):
 
     bi = sim_store['blast']
     blast = BlastSource(x=bi['x'], y=bi['y'], z=bi['z'],
-                        tnt_kg=bi['W_eff'] / 2.0,
+                        tnt_kg=bi['W_eff'] / SURFACE_BURST_FACTOR,
                         burst_type=bi['burst_type'])
     blast.W_eff = bi['W_eff']
 

@@ -28,7 +28,17 @@ TNT_EQUIVALENCY: dict = {
     'rdx':               ('RDX',                    1.14, 1.09),
     'hmx':               ('HMX',                    1.14, 1.02),
     'ammonium_nitrate':  ('Ammonium Nitrate (pure)', 0.42, 0.45),
+    # Vapour-cloud explosions (mass of gas in the flammable cloud).
+    # Energy-based equivalence: factor = yield_efficiency × ΔHc / ΔH_TNT
+    # with ~4 % yield efficiency (TNO / Baker-Strehlow typical 0.2–0.5 band).
+    'methane_vce':       ('Methane / Natural Gas (VCE)', 0.48, 0.48),
+    'propane_vce':       ('Propane / LPG (VCE)',         0.44, 0.44),
 }
+
+# Hemispherical surface burst: ideal ground reflection would double the
+# effective charge, but part of the energy is lost to ground shock and
+# cratering — UFC 3-340-02 practice uses a factor of 1.8.
+SURFACE_BURST_FACTOR = 1.8
 
 
 def tnt_equivalent(mass_kg: float, explosive_key: str) -> float:
@@ -66,10 +76,15 @@ def positive_duration(Z: float, W: float) -> float:
 
 
 def specific_impulse(Z: float, W: float) -> float:
-    """Specific positive impulse [kPa·ms].  Z in m/kg^(1/3), W in kg."""
+    """Specific positive impulse [kPa·ms].  Z in m/kg^(1/3), W in kg.
+
+    Kinney & Graham (1985):
+        Is = 0.067·√(1 + (Z/0.23)⁴) / (Z²·∛(1 + (Z/1.55)³))   [bar·ms·kg^(-1/3)]
+    The denominator bracket takes a cube root, not a square root.
+    """
     Z = np.maximum(Z, 0.05)
-    scaled = P_ATM * 0.067 * np.sqrt(1.0 + (Z / 0.23) ** 4) / (
-        Z ** 2 * np.sqrt(1.0 + (Z / 1.55) ** 3))
+    scaled = 6.7 * np.sqrt(1.0 + (Z / 0.23) ** 4) / (
+        Z ** 2 * np.cbrt(1.0 + (Z / 1.55) ** 3))   # 6.7 kPa·ms = 0.067 bar·ms
     return scaled * W ** (1.0 / 3.0)
 
 
@@ -110,7 +125,8 @@ class BlastSource:
 
     burst_type:
         'surface'  – hemispherical (gas leak indoor/outdoor ground burst);
-                     effective TNT doubled to account for ground reflection.
+                     effective TNT × SURFACE_BURST_FACTOR (1.8) for ground
+                     reflection minus ground-shock energy loss.
         'free_air' – spherical free-air burst.
     """
 
@@ -122,8 +138,8 @@ class BlastSource:
         self.explosive_type = explosive_type
         # Apply TNT equivalency factor for structural response
         w_tnt = tnt_equivalent(tnt_kg, explosive_type)
-        # Surface burst: energy confined to hemisphere → equivalent to 2× free-air
-        self.W_eff = w_tnt * 2.0 if burst_type == 'surface' else w_tnt
+        # Surface burst: hemispherical confinement (1.8× free-air, UFC 3-340-02)
+        self.W_eff = w_tnt * SURFACE_BURST_FACTOR if burst_type == 'surface' else w_tnt
         self.burst_type = burst_type
 
     def panel_loading(self,

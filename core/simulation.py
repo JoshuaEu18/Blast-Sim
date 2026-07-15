@@ -2,8 +2,10 @@
 Main simulation engine.
 
 Panel dynamics: each panel solved as an independent SDOF system
-  KLM·M·ÿ + C·ẏ + K·y = KL·P(t)·A
+  KLM·M·ÿ + C·ẏ + K·y = P(t)·A
   with explicit 4th-order Runge-Kutta via scipy.integrate.solve_ivp.
+  (Biggs equivalent system: KM·M·ÿ + KL·K·y = KL·F; dividing by KL gives
+  KLM·M·ÿ + K·y = F with KLM = KM/KL, so the load is NOT factored again.)
 
 Building frame: shear-building FEM (n_floors lateral DOFs).
   [M]{ÿ} + [C]{ẏ} + [K]{y} = {F(t)}
@@ -21,7 +23,7 @@ import numpy as np
 from scipy.integrate import solve_ivp
 from scipy.interpolate import interp1d
 
-from .blast import BlastSource, friedlander
+from .blast import BlastSource
 from .geometry import Panel, Column, Room
 from .materials import Material
 
@@ -80,67 +82,113 @@ class SimulationResult:
 
 def _integrate_panel(panel: Panel, blast: BlastSource,
                      t_arr: np.ndarray) -> PanelResult:
-    """Solve SDOF equation for one panel."""
+    """Solve SDOF equation for one panel.
+
+    The response is computed in three exact phases so the short blast pulse
+    can never be skipped by the adaptive ODE integrator:
+
+      1. Before arrival (t < toa): force and response are identically zero.
+      2. During the pulse (toa .. toa+td): solve_ivp with max_step = td/20
+         and the Friedlander force evaluated directly (no interpolant).
+      3. After the pulse: closed-form damped free vibration from the
+         end-of-pulse state — this is where the peak usually occurs and the
+         analytic form captures it exactly.
+
+    An earlier implementation integrated the full window with default
+    (unbounded) max_step: RK45 grew its step size over the quiet pre-arrival
+    phase and frequently leapt over the entire pulse, so whether a panel got
+    loaded at all depended on where the adaptive steps happened to land.
+    """
     pressure_arr, meta = blast.panel_loading(panel.center, panel.normal, t_arr)
     # Only panels facing toward the blast receive load
     # (panels on sheltered side get Pso/10 approximation)
     r = panel.center - blast.pos
     n = panel.normal
     facing = float(np.dot(-r / max(np.linalg.norm(r), 0.1), n))
+    facing_factor = 0.1 if facing < -0.1 else 1.0
+    pressure_arr  = pressure_arr * facing_factor
 
-    KL = 0.53    # load transformation factor (fixed-fixed)
+    # Biggs load-mass form: Me = KLM·M with KLM = KM/KL (set in geometry.py),
+    # so the applied force is the *unfactored* P(t)·A. Multiplying the load
+    # by KL here as well would double-count the transformation.
     Ke = panel.Ke
-    Me = panel.Me    # equivalent mass already includes KLM (computed in geometry.py)
+    Me = max(panel.Me, 1e-15)
     Ce = panel.Ce
     A  = panel.area
 
-    # Build pressure interpolant. For near-field blasts the positive-phase
-    # duration td can be shorter than dt_out (0.5 ms), meaning the entire
-    # blast pulse falls between two coarse time steps and is never sampled.
-    # When td < 10·dt, insert a fine sub-grid over the positive-phase window
-    # (td/20 resolution) so the peak is captured correctly.
-    facing_factor = 0.1 if facing < -0.1 else 1.0
-    pressure_arr  = pressure_arr * facing_factor   # apply once; used by both paths
-    dt_out = float(t_arr[1] - t_arr[0]) if len(t_arr) > 1 else 5e-4
-    td_s   = meta['td_ms'] * 1e-3
-    if td_s < 10.0 * dt_out:
-        toa_s   = meta['toa_s']
-        dt_fine = max(td_s / 20.0, dt_out / 10.0)
-        t_w0    = max(t_arr[0], toa_s)
-        t_w1    = min(t_arr[-1], toa_s + td_s * 1.5)
-        t_fine  = np.arange(t_w0, t_w1 + dt_fine, dt_fine)
-        t_comb  = np.unique(np.concatenate([t_arr, t_fine]))
-        t_sh    = (t_comb - toa_s) * 1e3          # shifted to ms for Friedlander
-        p_comb  = friedlander(t_sh, meta['Pr'], meta['td_ms'], meta['b']) * facing_factor
-        P_interp = interp1d(t_comb, p_comb * 1e3,
-                            kind='linear', bounds_error=False, fill_value=0.0)
-        peak_p = float(np.max(p_comb))
-    else:
-        P_interp = interp1d(t_arr, pressure_arr * 1e3,
-                            kind='linear', bounds_error=False, fill_value=0.0)
-        peak_p = float(np.max(pressure_arr))
+    toa   = float(meta['toa_s'])
+    td_ms = float(meta['td_ms'])
+    td_s  = td_ms * 1e-3
+    t_end = float(t_arr[-1])
+    Pr_eff = float(meta['Pr']) * facing_factor
 
-    def ode(t, y):
-        x, v = y
-        F = KL * P_interp(t) * A
-        a = (F - Ce * v - Ke * x) / max(Me, 1e-15)
-        return [v, a]
+    disp   = np.zeros_like(t_arr)
+    vel    = np.zeros_like(t_arr)
+    peak_d = 0.0
+    peak_p = Pr_eff if toa < t_end else 0.0   # Friedlander peak is at arrival
+    pulse_end = min(toa + td_s, t_end)
 
-    sol = solve_ivp(ode, [t_arr[0], t_arr[-1]], [0.0, 0.0],
-                    method='RK45', t_eval=t_arr,
-                    rtol=1e-4, atol=1e-7, dense_output=False)
+    if toa < t_end and td_s > 0.0:
+        # ── Phase 2: forced response over the pulse window ──────────────
+        b_wave = meta['b']
 
-    disp = sol.y[0]
-    vel  = sol.y[1]
-    peak_d = float(np.max(np.abs(disp)))
+        def ode(t, y):
+            x, v = y
+            tau_ms = (t - toa) * 1e3
+            p_kPa = Pr_eff * (1.0 - tau_ms / td_ms) * np.exp(-b_wave * tau_ms / td_ms) \
+                    if 0.0 <= tau_ms <= td_ms else 0.0
+            F = p_kPa * 1e3 * A
+            return [v, (F - Ce * v - Ke * x) / Me]
+
+        sol = solve_ivp(ode, [toa, pulse_end], [0.0, 0.0],
+                        method='RK45', max_step=max(td_s / 20.0, 1e-7),
+                        rtol=1e-5, atol=1e-9, dense_output=True)
+        x1 = float(sol.y[0, -1])
+        v1 = float(sol.y[1, -1])
+        peak_d = float(np.max(np.abs(sol.y[0])))
+
+        in_pulse = (t_arr >= toa) & (t_arr <= pulse_end)
+        if in_pulse.any():
+            y_p = sol.sol(t_arr[in_pulse])
+            disp[in_pulse] = y_p[0]
+            vel[in_pulse]  = y_p[1]
+
+        # ── Phase 3: analytic damped free vibration after the pulse ─────
+        wn   = np.sqrt(Ke / Me)
+        zeta = min(Ce / max(2.0 * np.sqrt(Ke * Me), 1e-15), 0.999)
+        wd   = wn * np.sqrt(1.0 - zeta ** 2)
+        C1   = x1
+        C2   = (v1 + zeta * wn * x1) / max(wd, 1e-12)
+
+        def free_resp(tau):
+            e = np.exp(-zeta * wn * tau)
+            x = e * (C1 * np.cos(wd * tau) + C2 * np.sin(wd * tau))
+            v = e * ((C2 * wd - zeta * wn * C1) * np.cos(wd * tau)
+                     - (C1 * wd + zeta * wn * C2) * np.sin(wd * tau))
+            return x, v
+
+        after = t_arr > pulse_end
+        if after.any():
+            xf, vf = free_resp(t_arr[after] - pulse_end)
+            disp[after] = xf
+            vel[after]  = vf
+
+        # Peak of the free phase occurs within the first natural period;
+        # sample it finely so peak displacement is not limited by dt_out.
+        if t_end > pulse_end and wd > 0.0:
+            tau_f = np.linspace(0.0, min(2.0 * np.pi / wd, t_end - pulse_end), 256)
+            xf, _ = free_resp(tau_f)
+            peak_d = max(peak_d, float(np.max(np.abs(xf))))
+
     di     = peak_d / max(panel.yield_disp, 1e-12)
     failed = peak_d >= panel.fail_disp
 
     t_fail = np.inf
     if failed:
         mask = np.abs(disp) >= panel.fail_disp
-        if mask.any():
-            t_fail = float(t_arr[np.argmax(mask)])
+        # Fine-grid peak may cross the threshold between coarse samples;
+        # fall back to end-of-pulse as the failure time in that case.
+        t_fail = float(t_arr[np.argmax(mask)]) if mask.any() else float(pulse_end)
 
     return PanelResult(
         panel_id=panel.id,
@@ -238,8 +286,12 @@ def _shear_building_fem(columns: List[Column], panels: List[Panel],
         return np.concatenate([du, a])
 
     y0  = np.zeros(2 * n_floors)
+    dt_out = float(t_arr[1] - t_arr[0]) if len(t_arr) > 1 else 5e-4
+    # max_step bounds the adaptive stepper so it cannot leap over the blast
+    # pulse during the quiet pre-arrival phase (same failure mode as the
+    # panel SDOF solver had).
     sol = solve_ivp(ode, [t_arr[0], t_arr[-1]], y0,
-                    method='RK45', t_eval=t_arr,
+                    method='RK45', t_eval=t_arr, max_step=dt_out,
                     rtol=1e-4, atol=1e-6)
 
     story_disp = sol.y[:n_floors, :]  # (n_floors, n_t)
@@ -321,20 +373,13 @@ def _interior_pressure(rooms: List[Room], panels: List[Panel],
 def _check_columns(columns: List[Column], panels: List[Panel],
                    blast: BlastSource, t_arr: np.ndarray,
                    floor_height: float) -> Dict[int, ColumnResult]:
+    from .blast import scaled_distance, peak_overpressure
+
     results: Dict[int, ColumnResult] = {}
     for col in columns:
-        # Tributary area: area of adjacent exterior wall panels
-        # Approximate by collecting panels on same floor
-        trib_area = 0.0
-        for p in panels:
-            if (p.panel_type == 'ext_wall' and p.floor_idx == 0):
-                trib_area += p.area / max(len([c for c in columns]), 1)
-                break
         # Conservative: use peak pressure × tributary area as shear demand
         r = col.base - blast.pos
         R = max(np.linalg.norm(r), 0.1)
-        from .blast import scaled_distance, peak_overpressure
-        from .materials import CONCRETE
         Z = np.clip(scaled_distance(R, blast.W_eff), 0.05, 40.0)
         Pso = peak_overpressure(Z) * 1e3   # Pa
         # Tributary area approximation
